@@ -1,0 +1,223 @@
+#cloud-config
+
+packages:
+  - docker
+  - jq
+  - amazon-cloudwatch-agent
+
+# /dev/xvdf is metadata-only on Nitro; resolve the actual NVMe device by serial.
+# Volume attachment races user-data on first boot; bootcmd runs early enough to
+# block disk_setup until the device appears.
+bootcmd:
+  - until [ -e /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${data_volume_id_no_dashes} ]; do sleep 2; done
+
+fs_setup:
+  - label: terrateam-data
+    filesystem: ext4
+    device: /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${data_volume_id_no_dashes}
+    overwrite: false
+
+mounts:
+  - [ "LABEL=terrateam-data", "/var/lib/postgresql", "ext4", "defaults,nofail", "0", "2" ]
+
+write_files:
+  - path: /opt/terrateam/docker-compose.yml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      services:
+        postgres:
+          image: postgres:14.13-bookworm
+          restart: unless-stopped
+          env_file: /opt/terrateam/.env
+          environment:
+            POSTGRES_USER: terrateam
+            POSTGRES_DB: terrateam
+          volumes:
+            - /var/lib/postgresql:/var/lib/postgresql/data
+        terrateam:
+          image: ghcr.io/terrateamio/terrat-oss:${terrateam_image_tag}
+          restart: unless-stopped
+          depends_on: [postgres]
+          env_file: /opt/terrateam/.env
+          environment:
+            DB_HOST: postgres
+            DB_PORT: 5432
+            DB_USER: terrateam
+            DB_NAME: terrateam
+            # PEM contents are passed inline (terrat-oss decodes via X509.Private_key.decode_pem
+            # and does not read a path). env_file can't carry multi-line values, so the systemd
+            # unit exports GITHUB_APP_PEM from /opt/terrateam/github-app.pem before invoking compose.
+            GITHUB_APP_PEM: $${GITHUB_APP_PEM}
+            # Without this, terrat-oss defaults to https://github.com/apps/terrateam-action
+            # (the public SaaS app), and the wizard's "Install GitHub App" button sends
+            # users to install the wrong app — our App credentials can't authenticate
+            # against installations of that one.
+            GITHUB_APP_URL: ${github_app_url}
+            TERRAT_API_BASE: https://${hostname}/api
+            TERRAT_UI_BASE: https://${hostname}
+            TERRAT_WEB_BASE_URL: https://${hostname}
+          ports:
+            - "127.0.0.1:8080:8080"
+        cloudflared:
+          image: cloudflare/cloudflared:${cloudflared_image_tag}
+          restart: unless-stopped
+          command: tunnel --no-autoupdate run
+          env_file: /opt/terrateam/.env
+          environment:
+            TUNNEL_TOKEN: $${TERRATEAM_TUNNEL_TOKEN}
+
+  - path: /etc/systemd/system/terrateam.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Terrateam docker-compose stack
+      After=docker.service network-online.target terrateam-render-secrets.service
+      Requires=docker.service terrateam-render-secrets.service
+
+      [Service]
+      Type=simple
+      WorkingDirectory=/opt/terrateam
+      # PEM is multi-line and can't live in env_file; export it into the parent env
+      # so compose's $${GITHUB_APP_PEM} interpolation picks it up.
+      ExecStart=/bin/bash -c 'GITHUB_APP_PEM="$(cat /opt/terrateam/github-app.pem)" exec /usr/bin/docker compose up'
+      ExecStop=/usr/bin/docker compose down
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /usr/local/sbin/terrateam-render-secrets.sh
+    owner: root:root
+    permissions: "0750"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+      trap 'log "FAILED at line $LINENO"' ERR
+
+      log "render-secrets: start"
+
+      install -d -m 0700 /opt/terrateam /run/terrateam
+
+      params=$(aws ssm get-parameters --with-decryption --region us-west-2 \
+        --names \
+          "${tunnel_token_param_name}" \
+          "${github_app_id_param}" \
+          "${github_app_pem_param}" \
+          "${github_app_client_id_param}" \
+          "${github_app_client_secret_param}" \
+          "${webhook_secret_param}" \
+          "${postgres_password_param}" \
+        --output json)
+
+      get_value() {
+        echo "$params" | jq -r --arg name "$1" '.Parameters[] | select(.Name == $name) | .Value'
+      }
+
+      tunnel_token=$(get_value "${tunnel_token_param_name}")
+      app_id=$(get_value "${github_app_id_param}")
+      app_pem=$(get_value "${github_app_pem_param}")
+      app_client_id=$(get_value "${github_app_client_id_param}")
+      app_client_secret=$(get_value "${github_app_client_secret_param}")
+      webhook_secret=$(get_value "${webhook_secret_param}")
+      postgres_password=$(get_value "${postgres_password_param}")
+      log "fetched 7 parameters from SSM"
+
+      tmp_env=$(mktemp -p /run/terrateam env.XXXXXX)
+      tmp_pem=$(mktemp -p /run/terrateam pem.XXXXXX)
+      trap 'rm -f "$tmp_env" "$tmp_pem"' EXIT
+
+      # POSTGRES_PASSWORD initialises the postgres container; DB_PASS is what terrat-oss reads.
+      # TERRATEAM_TUNNEL_TOKEN is referenced by the cloudflared service in compose.
+      # GITHUB_APP_PEM is multi-line and is not written here — see terrateam.service ExecStart.
+      cat > "$tmp_env" <<EOF
+      TERRATEAM_TUNNEL_TOKEN=$tunnel_token
+      GITHUB_APP_ID=$app_id
+      GITHUB_APP_CLIENT_ID=$app_client_id
+      GITHUB_APP_CLIENT_SECRET=$app_client_secret
+      GITHUB_WEBHOOK_SECRET=$webhook_secret
+      POSTGRES_PASSWORD=$postgres_password
+      DB_PASS=$postgres_password
+      EOF
+
+      printf '%s\n' "$app_pem" > "$tmp_pem"
+      chmod 0600 "$tmp_env" "$tmp_pem"
+
+      env_changed=0
+      pem_changed=0
+      if ! cmp -s "$tmp_env" /opt/terrateam/.env 2>/dev/null; then
+        mv "$tmp_env" /opt/terrateam/.env
+        env_changed=1
+      fi
+      if ! cmp -s "$tmp_pem" /opt/terrateam/github-app.pem 2>/dev/null; then
+        mv "$tmp_pem" /opt/terrateam/github-app.pem
+        pem_changed=1
+      fi
+
+      if [ "$env_changed" -eq 0 ] && [ "$pem_changed" -eq 0 ]; then
+        log "no change — exiting"
+        exit 0
+      fi
+      log "changed: env=$env_changed pem=$pem_changed"
+
+      # On first boot terrateam.service hasn't started yet — the Requires= dep
+      # ensures it reads the freshly-rendered .env when systemd starts it.
+      if systemctl is-active --quiet terrateam.service; then
+        log "restarting terrateam.service"
+        # --no-block: terrateam.service has Requires=terrateam-render-secrets.service,
+        # so a synchronous restart from inside this unit deadlocks — systemd waits for
+        # us to finish activating, and we're waiting for the restart to return.
+        systemctl restart --no-block terrateam.service
+      else
+        log "terrateam.service not active — render-only (boot path)"
+      fi
+
+  - path: /etc/systemd/system/terrateam-render-secrets.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Render Terrateam secrets from SSM into /opt/terrateam
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/terrateam-render-secrets.sh
+      StandardOutput=append:/var/log/terrateam-render-secrets.log
+      StandardError=inherit
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+    owner: root:root
+    permissions: "0644"
+    content: |
+      {
+        "logs": {
+          "logs_collected": {
+            "files": {
+              "collect_list": [
+                {
+                  "file_path": "/var/log/terrateam-render-secrets.log",
+                  "log_group_name": "${cw_log_group}",
+                  "log_stream_name": "{instance_id}/render-secrets"
+                }
+              ]
+            }
+          }
+        }
+      }
+
+runcmd:
+  - install -d -m 0755 /usr/local/lib/docker/cli-plugins
+  - curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose https://github.com/docker/compose/releases/download/v${compose_plugin_version}/docker-compose-linux-${compose_plugin_arch}
+  - chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+  - systemctl enable --now docker
+  - /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+  - systemctl daemon-reload
+  - systemctl enable --now terrateam-render-secrets.service terrateam.service

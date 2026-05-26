@@ -1,0 +1,8 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: terraform-aws-ec2-terrateam
+spec:
+  type: library
+  lifecycle: experimental
+  owner: platform
