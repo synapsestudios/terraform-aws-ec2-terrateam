@@ -13,7 +13,10 @@ resource "aws_cloudwatch_event_rule" "ssm_param_change" {
     source      = ["aws.ssm"]
     detail-type = ["Parameter Store Change"]
     detail = {
-      name = [for k, v in var.user_data_inputs : v]
+      # Filter nulls: tunnel_token_param_name is optional and is null in
+      # nginx_letsencrypt mode, which would otherwise put a null into the
+      # EventBridge event_pattern.
+      name = [for k, v in var.user_data_inputs : v if v != null]
     }
   })
 }

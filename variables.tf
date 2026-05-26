@@ -9,6 +9,26 @@ variable "name" {
   default     = "terrateam"
 }
 
+variable "ingress_mode" {
+  description = "How inbound traffic reaches terrat-oss. 'cloudflare_tunnel' (default) runs cloudflared with zero SG ingress; 'nginx_letsencrypt' opens 80/443 and runs nginx + certbot with Let's Encrypt TLS."
+  type        = string
+  default     = "cloudflare_tunnel"
+  validation {
+    condition     = contains(["cloudflare_tunnel", "nginx_letsencrypt"], var.ingress_mode)
+    error_message = "ingress_mode must be 'cloudflare_tunnel' or 'nginx_letsencrypt'."
+  }
+}
+
+variable "eip_allocation_id" {
+  description = "Allocation ID of a caller-owned Elastic IP to associate with the instance. Required (and only used) when ingress_mode = \"nginx_letsencrypt\": it provides a stable public IP that survives instance replacement, which the caller points a DNS A record at for Let's Encrypt issuance. The caller owns the aws_eip and the DNS record (mirrors the data-volume/DNS ownership boundary)."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.ingress_mode != "nginx_letsencrypt" || var.eip_allocation_id != null
+    error_message = "ingress_mode = \"nginx_letsencrypt\" requires eip_allocation_id (a caller-owned Elastic IP allocation)."
+  }
+}
+
 variable "hostname" {
   description = "Public hostname terrateam is served at. Used as TERRAT_UI_BASE / TERRAT_WEB_BASE_URL inside the container; the GitHub App's OAuth callback URL must point here."
   type        = string
@@ -57,9 +77,9 @@ variable "ssm_parameter_arns" {
 }
 
 variable "user_data_inputs" {
-  description = "Caller-supplied SSM parameter names that user-data fetches at boot"
+  description = "Caller-supplied SSM parameter names that user-data fetches at boot. tunnel_token_param_name is only used in ingress_mode = \"cloudflare_tunnel\" and is omitted in nginx_letsencrypt mode."
   type = object({
-    tunnel_token_param_name        = string
+    tunnel_token_param_name        = optional(string)
     github_app_id_param            = string
     github_app_pem_param           = string
     github_app_client_id_param     = string
@@ -67,6 +87,10 @@ variable "user_data_inputs" {
     webhook_secret_param           = string
     postgres_password_param        = string
   })
+  validation {
+    condition     = var.ingress_mode != "cloudflare_tunnel" || var.user_data_inputs.tunnel_token_param_name != null
+    error_message = "ingress_mode = \"cloudflare_tunnel\" requires user_data_inputs.tunnel_token_param_name (the Cloudflare Tunnel connector token SSM parameter name)."
+  }
 }
 
 variable "terrateam_image_tag" {
@@ -76,9 +100,27 @@ variable "terrateam_image_tag" {
 }
 
 variable "cloudflared_image_tag" {
-  description = "cloudflare/cloudflared image tag. Pinned by default; override deliberately."
+  description = "cloudflare/cloudflared image tag (ingress_mode = \"cloudflare_tunnel\" only). Pinned by default; override deliberately."
   type        = string
   default     = "2026.3.0"
+}
+
+variable "nginx_image_tag" {
+  description = "nginx image tag (ingress_mode = \"nginx_letsencrypt\" only). Pinned by default; override deliberately."
+  type        = string
+  default     = "1.27-alpine"
+}
+
+variable "certbot_image_tag" {
+  description = "certbot/certbot image tag (ingress_mode = \"nginx_letsencrypt\" only). Pinned by default; override deliberately."
+  type        = string
+  default     = "v2.11.0"
+}
+
+variable "acme_email" {
+  description = "Email registered with Let's Encrypt for expiry notices (ingress_mode = \"nginx_letsencrypt\" only). Optional; if omitted, certbot registers without an email (--register-unsafely-without-email)."
+  type        = string
+  default     = null
 }
 
 variable "compose_plugin_version" {

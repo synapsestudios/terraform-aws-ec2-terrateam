@@ -4,7 +4,7 @@ output "instance_id" {
 }
 
 output "public_ip" {
-  description = "Public IP of the Terrateam instance (egress address only; ingress is via Cloudflare Tunnel)"
+  description = "Public IP of the Terrateam instance. In cloudflare_tunnel mode this is an egress address only (ingress is via the tunnel). In nginx_letsencrypt mode the caller's associated Elastic IP is the inbound address; point the DNS A record at the EIP, not at this value."
   value       = aws_instance.this.public_ip
 }
 

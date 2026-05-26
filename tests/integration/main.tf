@@ -33,11 +33,28 @@ provider "aws" {
   }
 }
 
+variable "ingress_mode" {
+  description = "Which ingress mode to exercise. Defaults to cloudflare_tunnel; the nginx_letsencrypt.tftest.hcl run overrides it."
+  type        = string
+  default     = "cloudflare_tunnel"
+}
+
 locals {
   namespace = "ec2-terrateam-it"
   name      = "test"
   ami_id    = "ami-023a34a1153befb51"
   vpc_cidr  = "10.230.0.0/24"
+
+  # Mode-aware in-instance health probe (selected by ingress_mode).
+  probe_script = var.ingress_mode == "nginx_letsencrypt" ? file("${path.module}/scripts/health_probe_nginx.sh") : file("${path.module}/scripts/health_probe.sh")
+}
+
+# nginx_letsencrypt needs a stable public IP (the caller owns it). cloudflare_tunnel
+# has no inbound IP, so none is created.
+resource "aws_eip" "this" {
+  count  = var.ingress_mode == "nginx_letsencrypt" ? 1 : 0
+  domain = "vpc"
+  tags   = { Name = "${local.namespace}-${local.name}-eip" }
 }
 
 module "vpc" {
@@ -124,6 +141,10 @@ resource "aws_ssm_parameter" "postgres_password" {
 module "terrateam_server" {
   source = "../../"
 
+  ingress_mode      = var.ingress_mode
+  eip_allocation_id = var.ingress_mode == "nginx_letsencrypt" ? aws_eip.this[0].allocation_id : null
+  acme_email        = var.ingress_mode == "nginx_letsencrypt" ? "ops@test.invalid" : null
+
   namespace        = local.namespace
   name             = local.name
   hostname         = "terrateam.test.invalid"
@@ -133,25 +154,26 @@ module "terrateam_server" {
   ami_id           = local.ami_id
   data_volume_id   = aws_ebs_volume.data.id
 
-  ssm_parameter_arns = [
+  # Tunnel token is only wired in cloudflare_tunnel mode.
+  ssm_parameter_arns = concat([
     aws_ssm_parameter.github_app_id.arn,
     aws_ssm_parameter.github_app_pem.arn,
     aws_ssm_parameter.github_app_client_id.arn,
     aws_ssm_parameter.github_app_client_secret.arn,
     aws_ssm_parameter.webhook_secret.arn,
-    aws_ssm_parameter.tunnel_token.arn,
     aws_ssm_parameter.postgres_password.arn,
-  ]
+  ], var.ingress_mode == "cloudflare_tunnel" ? [aws_ssm_parameter.tunnel_token.arn] : [])
 
-  user_data_inputs = {
-    tunnel_token_param_name        = aws_ssm_parameter.tunnel_token.name
+  user_data_inputs = merge({
     github_app_id_param            = aws_ssm_parameter.github_app_id.name
     github_app_pem_param           = aws_ssm_parameter.github_app_pem.name
     github_app_client_id_param     = aws_ssm_parameter.github_app_client_id.name
     github_app_client_secret_param = aws_ssm_parameter.github_app_client_secret.name
     webhook_secret_param           = aws_ssm_parameter.webhook_secret.name
     postgres_password_param        = aws_ssm_parameter.postgres_password.name
-  }
+    }, var.ingress_mode == "cloudflare_tunnel" ? {
+    tunnel_token_param_name = aws_ssm_parameter.tunnel_token.name
+  } : {})
 
   log_group_prefix = "/${local.namespace}"
 }
@@ -166,10 +188,12 @@ resource "aws_ssm_association" "wait_for_terrateam" {
   }
 
   parameters = {
-    commands = jsonencode([file("${path.module}/scripts/health_probe.sh")])
+    commands = jsonencode([local.probe_script])
   }
 
-  wait_for_success_timeout_seconds = 900
+  # nginx_letsencrypt pulls four images (postgres + terrat-oss + nginx + certbot),
+  # so allow extra headroom over the tunnel-mode cold-pull time.
+  wait_for_success_timeout_seconds = 1200
 }
 
 output "terrateam_public_ip" {

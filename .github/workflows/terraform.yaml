@@ -48,7 +48,12 @@ jobs:
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.13.4
+      # The integration suite is a self-contained root module (VPC + EBS + SSM +
+      # the module under test) under tests/integration, so it runs from there —
+      # unlike the unit suite, which tests this repo's root module via mock_provider.
       - name: terraform init
-        run: terraform init -test-directory=tests/integration
+        working-directory: tests/integration
+        run: terraform init
       - name: terraform test
-        run: terraform test -test-directory=tests/integration
+        working-directory: tests/integration
+        run: terraform test
