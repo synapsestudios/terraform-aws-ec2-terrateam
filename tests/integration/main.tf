@@ -46,10 +46,11 @@ variable "ingress_mode" {
 }
 
 locals {
-  namespace = "ec2-terrateam-it"
-  name      = "test"
-  ami_id    = "ami-023a34a1153befb51"
-  vpc_cidr  = "10.230.0.0/24"
+  namespace     = "ec2-terrateam-it"
+  name          = "test"
+  ami_id        = "ami-023a34a1153befb51"
+  vpc_cidr      = "10.230.0.0/24"
+  test_hostname = "terrateam.test.invalid"
 
   # Mode-aware in-instance health probe (selected by ingress_mode).
   probe_script = var.ingress_mode == "nginx_letsencrypt" ? file("${path.module}/scripts/health_probe_nginx.sh") : file("${path.module}/scripts/health_probe.sh")
@@ -153,7 +154,7 @@ module "terrateam_server" {
 
   namespace        = local.namespace
   name             = local.name
-  hostname         = "terrateam.test.invalid"
+  hostname         = local.test_hostname
   github_app_url   = "https://github.com/apps/terrateam-test"
   vpc_id           = module.vpc.vpc_id
   public_subnet_id = module.vpc.public_subnets[0]
@@ -210,7 +211,7 @@ data "external" "ingress_probe" {
   count      = var.ingress_mode == "nginx_letsencrypt" ? 1 : 0
   depends_on = [aws_ssm_association.wait_for_terrateam]
   program    = ["bash", "${path.module}/scripts/external_probe.sh"]
-  query      = { eip = aws_eip.this[0].public_ip }
+  query      = { eip = aws_eip.this[0].public_ip, host = local.test_hostname }
 }
 
 output "terrateam_public_ip" {
