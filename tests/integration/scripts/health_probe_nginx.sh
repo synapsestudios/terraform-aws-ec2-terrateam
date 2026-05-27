@@ -27,6 +27,14 @@ if ! cloud-init status --wait; then
 fi
 echo "OK: cloud-init done"
 
+# The renewal mechanism must actually be wired up, not just present as a file.
+if ! systemctl is-enabled --quiet terrateam-cert-renew.timer; then
+  echo "FAIL: terrateam-cert-renew.timer is not enabled"
+  systemctl status terrateam-cert-renew.timer --no-pager || true
+  exit 1
+fi
+echo "OK: cert-renew timer enabled"
+
 PROXY_OK=0
 for i in $(seq 1 120); do
   # :80 — everything except the ACME path 301-redirects to HTTPS.

@@ -16,6 +16,12 @@ terraform {
       source  = "hashicorp/tls"
       version = "~> 4.0"
     }
+    # Runs a runner-side curl against the EIP to test the public ingress path
+    # (the in-instance SSM probe hits localhost and can't exercise the SG/EIP).
+    external = {
+      source  = "hashicorp/external"
+      version = "~> 2.3"
+    }
   }
 }
 
@@ -194,6 +200,17 @@ resource "aws_ssm_association" "wait_for_terrateam" {
   # nginx_letsencrypt pulls four images (postgres + terrat-oss + nginx + certbot),
   # so allow extra headroom over the tunnel-mode cold-pull time.
   wait_for_success_timeout_seconds = 1200
+}
+
+# Public-path probe for nginx_letsencrypt: curls the EIP from the runner (outside
+# the instance) so it actually traverses the security group and the EIP, unlike
+# the in-instance SSM probe. Ordered after the SSM association so nginx is up.
+# Always exits 0 and returns the observed HTTP codes for the test to assert on.
+data "external" "ingress_probe" {
+  count      = var.ingress_mode == "nginx_letsencrypt" ? 1 : 0
+  depends_on = [aws_ssm_association.wait_for_terrateam]
+  program    = ["bash", "${path.module}/scripts/external_probe.sh"]
+  query      = { eip = aws_eip.this[0].public_ip }
 }
 
 output "terrateam_public_ip" {
