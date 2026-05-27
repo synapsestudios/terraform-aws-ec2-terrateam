@@ -4,9 +4,12 @@ terraform {
   backend "local" {}
 
   required_providers {
+    # AWS provider version is intentionally omitted: it derives from the module
+    # under test (../../versions.tf, >= 5.0) via constraint intersection at init,
+    # so there is exactly one place the AWS version policy lives. random/tls/
+    # external below are this harness's own deps and keep their constraints here.
     aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+      source = "hashicorp/aws"
     }
     random = {
       source  = "hashicorp/random"
