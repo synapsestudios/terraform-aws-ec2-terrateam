@@ -108,13 +108,13 @@ variable "cloudflared_image_tag" {
 variable "nginx_image_tag" {
   description = "nginx image tag (ingress_mode = \"nginx_letsencrypt\" only). Pinned by default; override deliberately."
   type        = string
-  default     = "1.27-alpine"
+  default     = "1.31.1-alpine"
 }
 
 variable "certbot_image_tag" {
   description = "certbot/certbot image tag (ingress_mode = \"nginx_letsencrypt\" only). Pinned by default; override deliberately."
   type        = string
-  default     = "v2.11.0"
+  default     = "v5.6.0"
 }
 
 variable "acme_email" {
