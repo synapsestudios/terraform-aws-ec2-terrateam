@@ -25,47 +25,15 @@ write_files:
     owner: root:root
     permissions: "0644"
     content: |
-      services:
-        postgres:
-          image: postgres:14.13-bookworm
-          restart: unless-stopped
-          env_file: /opt/terrateam/.env
-          environment:
-            POSTGRES_USER: terrateam
-            POSTGRES_DB: terrateam
-          volumes:
-            - /var/lib/postgresql:/var/lib/postgresql/data
-        terrateam:
-          image: ghcr.io/terrateamio/terrat-oss:${terrateam_image_tag}
-          restart: unless-stopped
-          depends_on: [postgres]
-          env_file: /opt/terrateam/.env
-          environment:
-            DB_HOST: postgres
-            DB_PORT: 5432
-            DB_USER: terrateam
-            DB_NAME: terrateam
-            # PEM contents are passed inline (terrat-oss decodes via X509.Private_key.decode_pem
-            # and does not read a path). env_file can't carry multi-line values, so the systemd
-            # unit exports GITHUB_APP_PEM from /opt/terrateam/github-app.pem before invoking compose.
-            GITHUB_APP_PEM: $${GITHUB_APP_PEM}
-            # Without this, terrat-oss defaults to https://github.com/apps/terrateam-action
-            # (the public SaaS app), and the wizard's "Install GitHub App" button sends
-            # users to install the wrong app — our App credentials can't authenticate
-            # against installations of that one.
-            GITHUB_APP_URL: ${github_app_url}
-            TERRAT_API_BASE: https://${hostname}/api
-            TERRAT_UI_BASE: https://${hostname}
-            TERRAT_WEB_BASE_URL: https://${hostname}
-          ports:
-            - "127.0.0.1:8080:8080"
-        cloudflared:
-          image: cloudflare/cloudflared:${cloudflared_image_tag}
-          restart: unless-stopped
-          command: tunnel --no-autoupdate run
-          env_file: /opt/terrateam/.env
-          environment:
-            TUNNEL_TOKEN: $${TERRATEAM_TUNNEL_TOKEN}
+      ${indent(6, chomp(compose_yml))}
+%{ if ingress_mode == "nginx_letsencrypt" ~}
+
+  - path: /opt/terrateam/nginx.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      ${indent(6, chomp(nginx_conf))}
+%{ endif ~}
 
   - path: /etc/systemd/system/terrateam.service
     owner: root:root
@@ -104,7 +72,9 @@ write_files:
 
       params=$(aws ssm get-parameters --with-decryption --region us-west-2 \
         --names \
+%{ if tunnel_token_param_name != null ~}
           "${tunnel_token_param_name}" \
+%{ endif ~}
           "${github_app_id_param}" \
           "${github_app_pem_param}" \
           "${github_app_client_id_param}" \
@@ -117,24 +87,29 @@ write_files:
         echo "$params" | jq -r --arg name "$1" '.Parameters[] | select(.Name == $name) | .Value'
       }
 
+%{ if tunnel_token_param_name != null ~}
       tunnel_token=$(get_value "${tunnel_token_param_name}")
+%{ endif ~}
       app_id=$(get_value "${github_app_id_param}")
       app_pem=$(get_value "${github_app_pem_param}")
       app_client_id=$(get_value "${github_app_client_id_param}")
       app_client_secret=$(get_value "${github_app_client_secret_param}")
       webhook_secret=$(get_value "${webhook_secret_param}")
       postgres_password=$(get_value "${postgres_password_param}")
-      log "fetched 7 parameters from SSM"
+      log "fetched parameters from SSM"
 
       tmp_env=$(mktemp -p /run/terrateam env.XXXXXX)
       tmp_pem=$(mktemp -p /run/terrateam pem.XXXXXX)
       trap 'rm -f "$tmp_env" "$tmp_pem"' EXIT
 
       # POSTGRES_PASSWORD initialises the postgres container; DB_PASS is what terrat-oss reads.
-      # TERRATEAM_TUNNEL_TOKEN is referenced by the cloudflared service in compose.
+      # TERRATEAM_TUNNEL_TOKEN is referenced by the cloudflared service in compose
+      # (cloudflare_tunnel mode only; omitted when no tunnel_token_param_name is supplied).
       # GITHUB_APP_PEM is multi-line and is not written here — see terrateam.service ExecStart.
       cat > "$tmp_env" <<EOF
+%{ if tunnel_token_param_name != null ~}
       TERRATEAM_TUNNEL_TOKEN=$tunnel_token
+%{ endif ~}
       GITHUB_APP_ID=$app_id
       GITHUB_APP_CLIENT_ID=$app_client_id
       GITHUB_APP_CLIENT_SECRET=$app_client_secret
@@ -206,12 +181,79 @@ write_files:
                   "file_path": "/var/log/terrateam-render-secrets.log",
                   "log_group_name": "${cw_log_group}",
                   "log_stream_name": "{instance_id}/render-secrets"
-                }
+                }%{ if ingress_mode == "nginx_letsencrypt" ~},
+                {
+                  "file_path": "/opt/terrateam/nginx-logs/access.log",
+                  "log_group_name": "${log_group_prefix}/nginx",
+                  "log_stream_name": "{instance_id}/nginx-access"
+                },
+                {
+                  "file_path": "/opt/terrateam/nginx-logs/error.log",
+                  "log_group_name": "${log_group_prefix}/nginx",
+                  "log_stream_name": "{instance_id}/nginx-error"
+                },
+                {
+                  "file_path": "/var/log/terrateam-cert-renew.log",
+                  "log_group_name": "${log_group_prefix}/cert-renew",
+                  "log_stream_name": "{instance_id}/cert-renew"
+                }%{ endif ~}
               ]
             }
           }
         }
       }
+%{ if ingress_mode == "nginx_letsencrypt" ~}
+
+  - path: /usr/local/sbin/terrateam-cert-renew.sh
+    owner: root:root
+    permissions: "0750"
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+      log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+      log "cert-renew: start"
+      cd /opt/terrateam
+      # Renew due certs (no-op until ~30 days before expiry); the certbot sidecar
+      # holds the webroot + /etc/letsencrypt mounts and the per-cert renewal config.
+      docker compose exec -T certbot certbot renew --quiet || log "certbot renew returned non-zero"
+      # Reload nginx unconditionally: graceful and cheap, and also picks up the first
+      # real cert the boot-time sidecar issued (renew alone won't reload a fresh cert).
+      docker compose exec -T nginx nginx -s reload || log "nginx reload returned non-zero"
+      log "cert-renew: done"
+
+  - path: /etc/systemd/system/terrateam-cert-renew.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Renew Let's Encrypt certs and reload nginx
+      After=terrateam.service
+      Requires=terrateam.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/terrateam-cert-renew.sh
+      StandardOutput=append:/var/log/terrateam-cert-renew.log
+      StandardError=inherit
+
+  - path: /etc/systemd/system/terrateam-cert-renew.timer
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Twice-daily Let's Encrypt renewal for Terrateam
+
+      [Timer]
+      # First run shortly after boot picks up the sidecar's first issuance; then
+      # twice daily with jitter. Persistent catches up missed runs after downtime.
+      OnBootSec=5min
+      OnUnitActiveSec=12h
+      RandomizedDelaySec=1h
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+%{ endif ~}
 
 runcmd:
   - install -d -m 0755 /usr/local/lib/docker/cli-plugins
@@ -220,4 +262,18 @@ runcmd:
   - systemctl enable --now docker
   - /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
   - systemctl daemon-reload
+%{ if ingress_mode == "nginx_letsencrypt" ~}
+  # Bootstrap so nginx can bind :443 before certbot's first issuance: create the
+  # shared ACME webroot + cert dirs and drop a 1-day self-signed placeholder at
+  # the live cert path. The certbot sidecar replaces it with the real Let's
+  # Encrypt cert (or restores the placeholder if issuance fails).
+  - install -d -m 0755 /opt/terrateam/acme-webroot
+  - install -d -m 0755 /opt/terrateam/nginx-logs
+  - install -d -m 0700 /opt/terrateam/letsencrypt
+  - install -d -m 0755 /opt/terrateam/letsencrypt/live/${hostname}
+  - if [ ! -f /opt/terrateam/letsencrypt/live/${hostname}/fullchain.pem ]; then openssl req -x509 -nodes -newkey rsa:2048 -days 1 -keyout /opt/terrateam/letsencrypt/live/${hostname}/privkey.pem -out /opt/terrateam/letsencrypt/live/${hostname}/fullchain.pem -subj "/CN=${hostname}"; fi
+%{ endif ~}
   - systemctl enable --now terrateam-render-secrets.service terrateam.service
+%{ if ingress_mode == "nginx_letsencrypt" ~}
+  - systemctl enable --now terrateam-cert-renew.timer
+%{ endif ~}

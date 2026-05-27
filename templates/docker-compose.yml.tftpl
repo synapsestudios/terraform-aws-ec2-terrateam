@@ -1,0 +1,88 @@
+services:
+  postgres:
+    image: postgres:14.13-bookworm
+    restart: unless-stopped
+    env_file: /opt/terrateam/.env
+    environment:
+      POSTGRES_USER: terrateam
+      POSTGRES_DB: terrateam
+    volumes:
+      - /var/lib/postgresql:/var/lib/postgresql/data
+  terrateam:
+    image: ghcr.io/terrateamio/terrat-oss:${terrateam_image_tag}
+    restart: unless-stopped
+    depends_on: [postgres]
+    env_file: /opt/terrateam/.env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: terrateam
+      DB_NAME: terrateam
+      # PEM contents are passed inline (terrat-oss decodes via X509.Private_key.decode_pem
+      # and does not read a path). env_file can't carry multi-line values, so the systemd
+      # unit exports GITHUB_APP_PEM from /opt/terrateam/github-app.pem before invoking compose.
+      GITHUB_APP_PEM: $${GITHUB_APP_PEM}
+      # Without this, terrat-oss defaults to https://github.com/apps/terrateam-action
+      # (the public SaaS app), and the wizard's "Install GitHub App" button sends
+      # users to install the wrong app — our App credentials can't authenticate
+      # against installations of that one.
+      GITHUB_APP_URL: ${github_app_url}
+      TERRAT_API_BASE: https://${hostname}/api
+      TERRAT_UI_BASE: https://${hostname}
+      TERRAT_WEB_BASE_URL: https://${hostname}
+%{ if ingress_mode == "cloudflare_tunnel" ~}
+    # Published to loopback so cloudflared (host-reachable) can dial it.
+    ports:
+      - "127.0.0.1:8080:8080"
+  cloudflared:
+    image: cloudflare/cloudflared:${cloudflared_image_tag}
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    env_file: /opt/terrateam/.env
+    environment:
+      TUNNEL_TOKEN: $${TERRATEAM_TUNNEL_TOKEN}
+%{ else ~}
+    # Internal-only: reachable on the compose network by nginx, never host-published.
+    expose:
+      - "8080"
+  nginx:
+    image: nginx:${nginx_image_tag}
+    restart: unless-stopped
+    depends_on: [terrateam]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /opt/terrateam/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /opt/terrateam/letsencrypt:/etc/letsencrypt:ro
+      - /opt/terrateam/acme-webroot:/var/www/certbot:ro
+      # Host-mounted so access/error logs land in files the CW agent ships.
+      - /opt/terrateam/nginx-logs:/var/log/nginx
+  certbot:
+    image: certbot/certbot:${certbot_image_tag}
+    restart: unless-stopped
+    depends_on: [nginx]
+    volumes:
+      - /opt/terrateam/letsencrypt:/etc/letsencrypt
+      - /opt/terrateam/acme-webroot:/var/www/certbot
+    # Initial issuance only; renewal is the host systemd timer (cert expiry has no
+    # event source). '|| true; sleep infinity' keeps the sidecar from crash-looping
+    # if issuance fails (e.g. DNS not yet resolvable) — nginx stays up on its
+    # self-signed bootstrap cert and the host timer retries renewal once a cert exists.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # No renewal config yet => first boot. Clear the host's self-signed
+        # placeholder so certbot owns the lineage cleanly (avoids a -0001 suffix).
+        if [ ! -f /etc/letsencrypt/renewal/${hostname}.conf ]; then
+          rm -rf /etc/letsencrypt/live/${hostname} /etc/letsencrypt/archive/${hostname}
+        fi
+        certbot certonly --webroot -w /var/www/certbot -d ${hostname} ${certbot_email_arg} --agree-tos --non-interactive || true
+        # If issuance failed (e.g. DNS not resolvable yet), restore a placeholder so
+        # nginx keeps serving :443; the host renew timer retries later.
+        if [ ! -f /etc/letsencrypt/live/${hostname}/fullchain.pem ]; then
+          mkdir -p /etc/letsencrypt/live/${hostname}
+          openssl req -x509 -nodes -newkey rsa:2048 -days 1 -keyout /etc/letsencrypt/live/${hostname}/privkey.pem -out /etc/letsencrypt/live/${hostname}/fullchain.pem -subj "/CN=${hostname}"
+        fi
+        sleep infinity
+%{ endif ~}
