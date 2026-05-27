@@ -153,6 +153,13 @@ resource "aws_instance" "this" {
     compose_yml                    = local.compose_yml
   })
 
+  # Recreate (not the default stop/start) when user_data changes, so cloud-init
+  # actually re-runs the new config — e.g. an ingress_mode switch or an image-tag
+  # bump. Durable state survives the recreate: Postgres lives on the external EBS
+  # volume, and nginx_letsencrypt keeps its caller-owned EIP + DNS, so the public
+  # address is stable. Without this, a mode switch silently no-ops on the host.
+  user_data_replace_on_change = true
+
   metadata_options {
     http_tokens   = "required"
     http_endpoint = "enabled"

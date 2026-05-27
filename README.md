@@ -67,6 +67,10 @@ module "terrateam" {
 
 The "no ingress — reachable only via Cloudflare Tunnel" posture is a deliberate headline feature. **`nginx_letsencrypt` abandons it**: the host is directly exposed on 80/443 and loses Cloudflare's edge DDoS shielding and WAF. Choose it only when you can't/won't depend on Cloudflare and accept terminating TLS on a directly-exposed host. The default stays `cloudflare_tunnel`.
 
+### Switching modes
+
+Changing `ingress_mode` on an existing deployment **recreates the instance** (the module sets `user_data_replace_on_change = true`, because cloud-init only runs at first boot — a stop/start would leave the host on the old ingress stack). The recreate is non-destructive to durable state: Postgres data is on the caller's EBS volume, and `nginx_letsencrypt` keeps its caller-owned EIP + DNS A record, so the public address is stable across the switch. Switching to `nginx_letsencrypt` requires adding `eip_allocation_id` (and dropping the now-unused tunnel-token parameter); switching back requires the reverse. Same applies to image-tag bumps — they take effect by recreating the host, not in place.
+
 ### Using `nginx_letsencrypt`
 
 ```hcl
