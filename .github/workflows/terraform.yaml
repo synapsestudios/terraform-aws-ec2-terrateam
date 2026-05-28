@@ -3,6 +3,11 @@ name: Terraform Tests
 on:
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Weekly canary (Mondays 16:17 UTC): re-run the fast lane against the latest
+    # AWS provider so a breaking new release is caught even before Dependabot
+    # opens a lock-bump PR.
+    - cron: "17 16 * * 1"
 
 # Least-privilege default: both jobs only read the repo and run terraform.
 # Static-key AWS auth needs no id-token; GitHub reports job status as checks
@@ -18,9 +23,18 @@ concurrency:
 
 jobs:
   fast-checks:
-    name: Fast Checks
-    if: github.event_name == 'pull_request'
+    name: Fast Checks (${{ matrix.provider }})
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Validate the module's `>= 5.0` floor at BOTH ends, plus the reproducible
+        # locked version. `locked` uses the committed lock; `floor`/`latest`
+        # re-resolve. mock_provider means no AWS creds are needed, while validate
+        # and the unit tests still load the real provider schema — so a v5 -> v6
+        # schema break surfaces here cheaply, before it reaches the real-infra lane.
+        provider: [locked, floor, latest]
     steps:
       - uses: actions/checkout@v6
       - uses: hashicorp/setup-terraform@v4
@@ -28,8 +42,27 @@ jobs:
           terraform_version: 1.13.4
       - name: terraform fmt
         run: terraform fmt -recursive -check
-      - name: terraform init
-        run: terraform init -test-directory=tests/unit
+      - name: Resolve provider (${{ matrix.provider }})
+        run: |
+          set -euo pipefail
+          case "${{ matrix.provider }}" in
+            locked)
+              # Reproducible: use the committed lock as-is.
+              terraform init -test-directory=tests/unit
+              ;;
+            floor)
+              # Force the lowest version the `>= 5.0` floor allows and re-resolve,
+              # ignoring the committed lock — proves the declared floor is honest.
+              sed -i 's/version = ">= 5.0"/version = "= 5.0.0"/' versions.tf
+              rm -f .terraform.lock.hcl
+              terraform init -upgrade -test-directory=tests/unit
+              ;;
+            latest)
+              # Newest provider satisfying the floor — the compatibility canary.
+              rm -f .terraform.lock.hcl
+              terraform init -upgrade -test-directory=tests/unit
+              ;;
+          esac
       - name: terraform validate
         run: terraform validate
       - name: terraform test

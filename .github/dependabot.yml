@@ -8,8 +8,19 @@ updates:
       timezone: "America/Phoenix"
 
   - package-ecosystem: "terraform"
-    directory: "/"
+    # Two Terraform working dirs, each with its own lock file: the module root (/),
+    # exercised by the unit lane, and the integration harness (/tests/integration)
+    # that sources the module. Watch both so their locks stay current. No ignore —
+    # provider majors flow through as PRs and CI tests them; because the module
+    # declares a >= floor, a bump can only move a lock pin, never create an
+    # unsatisfiable constraint (the failure that took down the earlier v6 PR).
+    directories:
+      - "/"
+      - "/tests/integration"
     schedule:
       interval: "weekly"
       time: "09:00"
       timezone: "America/Phoenix"
+    groups:
+      terraform-providers:
+        patterns: ["*"]
