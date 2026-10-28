@@ -17,11 +17,6 @@ locals {
 
   cw_log_group_name = "${var.log_group_prefix}/render-secrets"
 
-  # Arguments for `certbot certonly`, defined once because two places issue the
-  # certificate: the certbot sidecar at boot, and the host cert-renew timer when
-  # it finds no lineage (a retry for a first issuance that failed, e.g. because
-  # DNS was not live yet). One string keeps the two from drifting. The
-  # registration flag is --email when acme_email is set, else unattended.
   certbot_certonly_args = join(" ", [
     "--webroot -w /var/www/certbot -d ${var.hostname}",
     var.acme_email != null ? "--email ${var.acme_email}" : "--register-unsafely-without-email",
@@ -163,10 +158,6 @@ resource "aws_instance" "this" {
     compose_yml                    = local.compose_yml
   })
 
-  # EC2 caps user_data at 16384 bytes and nginx_letsencrypt mode renders close
-  # to it (the unit suite pins the headroom with a long hostname). Comments
-  # inside the templates ship to the instance, so keep them short.
-  #
   # Recreate (not the default stop/start) when user_data changes, so cloud-init
   # actually re-runs the new config — e.g. an ingress_mode switch or an image-tag
   # bump. Durable state survives the recreate: Postgres lives on the external EBS

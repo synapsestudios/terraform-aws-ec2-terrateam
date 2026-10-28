@@ -5,9 +5,6 @@ packages:
   - jq
   - amazon-cloudwatch-agent
 
-# /dev/xvdf is metadata-only on Nitro; resolve the actual NVMe device by serial.
-# Volume attachment races user-data on first boot; bootcmd runs early enough to
-# block disk_setup until the device appears.
 bootcmd:
   - until [ -e /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${data_volume_id_no_dashes} ]; do sleep 2; done
 
@@ -47,8 +44,6 @@ write_files:
       [Service]
       Type=simple
       WorkingDirectory=/opt/terrateam
-      # PEM is multi-line and can't live in env_file; export it into the parent env
-      # so compose's $${GITHUB_APP_PEM} interpolation picks it up.
       ExecStart=/bin/bash -c 'GITHUB_APP_PEM="$(cat /opt/terrateam/github-app.pem)" exec /usr/bin/docker compose up'
       ExecStop=/usr/bin/docker compose down
       Restart=on-failure
@@ -102,10 +97,6 @@ write_files:
       tmp_pem=$(mktemp -p /run/terrateam pem.XXXXXX)
       trap 'rm -f "$tmp_env" "$tmp_pem"' EXIT
 
-      # POSTGRES_PASSWORD initialises the postgres container; DB_PASS is what terrat-oss reads.
-      # TERRATEAM_TUNNEL_TOKEN is referenced by the cloudflared service in compose
-      # (cloudflare_tunnel mode only; omitted when no tunnel_token_param_name is supplied).
-      # GITHUB_APP_PEM is multi-line and is not written here — see terrateam.service ExecStart.
       cat > "$tmp_env" <<EOF
 %{ if tunnel_token_param_name != null ~}
       TERRATEAM_TUNNEL_TOKEN=$tunnel_token
@@ -138,13 +129,8 @@ write_files:
       fi
       log "changed: env=$env_changed pem=$pem_changed"
 
-      # On first boot terrateam.service hasn't started yet — the Requires= dep
-      # ensures it reads the freshly-rendered .env when systemd starts it.
       if systemctl is-active --quiet terrateam.service; then
         log "restarting terrateam.service"
-        # --no-block: terrateam.service has Requires=terrateam-render-secrets.service,
-        # so a synchronous restart from inside this unit deadlocks — systemd waits for
-        # us to finish activating, and we're waiting for the restart to return.
         systemctl restart --no-block terrateam.service
       else
         log "terrateam.service not active — render-only (boot path)"
@@ -215,11 +201,8 @@ write_files:
       cd /opt/terrateam
       le=/opt/terrateam/letsencrypt; h=${hostname}
       if [ -f "$le/renewal/$h.conf" ]; then
-        # Renew due certs (no-op until ~30 days before expiry).
         docker compose exec -T certbot certbot renew --quiet || log "certbot renew returned non-zero"
       else
-        # No lineage (boot-time issuance failed, e.g. DNS not live yet): renew would
-        # no-op forever, so retry certonly. Clear the placeholder first; restore it on failure.
         log "no lineage for $h; retrying first issuance"
         rm -rf "$le/live/$h" "$le/archive/$h"
         docker compose exec -T certbot certbot certonly ${certbot_certonly_args} || log "certbot certonly returned non-zero"
@@ -228,7 +211,6 @@ write_files:
           openssl req -x509 -nodes -newkey rsa:2048 -days 1 -keyout "$le/live/$h/privkey.pem" -out "$le/live/$h/fullchain.pem" -subj "/CN=$h"
         fi
       fi
-      # Reload nginx unconditionally: graceful, cheap, and picks up a fresh cert.
       docker compose exec -T nginx nginx -s reload || log "nginx reload returned non-zero"
       log "cert-renew: done"
 
@@ -255,8 +237,6 @@ write_files:
       Description=Twice-daily Let's Encrypt renewal for Terrateam
 
       [Timer]
-      # First run shortly after boot picks up the sidecar's first issuance; then
-      # twice daily with jitter. Persistent catches up missed runs after downtime.
       OnBootSec=5min
       OnUnitActiveSec=12h
       RandomizedDelaySec=1h
@@ -274,10 +254,6 @@ runcmd:
   - /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
   - systemctl daemon-reload
 %{ if ingress_mode == "nginx_letsencrypt" ~}
-  # Bootstrap so nginx can bind :443 before certbot's first issuance: create the
-  # shared ACME webroot + cert dirs and drop a 1-day self-signed placeholder at
-  # the live cert path. The certbot sidecar replaces it with the real Let's
-  # Encrypt cert (or restores the placeholder if issuance fails).
   - install -d -m 0755 /opt/terrateam/acme-webroot /opt/terrateam/nginx-logs
   - install -d -m 0700 /opt/terrateam/letsencrypt
   - d=/opt/terrateam/letsencrypt/live/${hostname}; install -d -m 0755 "$d"; if [ ! -f "$d/fullchain.pem" ]; then openssl req -x509 -nodes -newkey rsa:2048 -days 1 -keyout "$d/privkey.pem" -out "$d/fullchain.pem" -subj "/CN=${hostname}"; fi

@@ -19,8 +19,6 @@ mock_provider "aws" {
       name = "us-west-2"
     }
   }
-  # Pin the EIP's address so the Route 53 record assertions can check that the
-  # module wires the looked-up IP (not a random mock string) into the record.
   mock_data "aws_eip" {
     defaults = {
       public_ip = "203.0.113.10"
@@ -302,8 +300,6 @@ run "nginx_mode_compose_runs_nginx_and_certbot" {
     error_message = "certbot must register with the supplied acme_email"
   }
 
-  # Compose interpolates $VAR in command strings from its own environment, so the
-  # sidecar's shell variables must be written as $$VAR to reach the shell intact.
   assert {
     condition     = strcontains(aws_instance.this.user_data, "h=terrateam.example.com; d=/etc/letsencrypt/live/$$h") && !strcontains(aws_instance.this.user_data, "/etc/letsencrypt/live/$h")
     error_message = "the certbot sidecar script must escape its shell variables as $$h / $$d so docker compose does not interpolate them to empty strings"
@@ -695,8 +691,6 @@ run "route53_record_points_at_eip_in_nginx_mode" {
 }
 
 run "route53_record_fqdn_output_in_nginx_mode_with_zone" {
-  # apply (not plan): fqdn is computed by the provider from the zone's domain and
-  # is unknown until the record exists, so a plan-time assertion can't evaluate.
   command = apply
 
   variables {
@@ -720,11 +714,6 @@ run "route53_record_fqdn_output_in_nginx_mode_with_zone" {
 }
 
 run "nginx_mode_cert_renew_retries_first_issuance" {
-  # A missed first issuance (DNS not live when the certbot sidecar ran) never
-  # self-heals with `certbot renew` alone: renew is a no-op with no lineage. The
-  # host timer must fall back to `certonly` until a lineage exists. This matters
-  # more once the module creates the record, because nothing orders certbot
-  # after Route 53 reports the record in sync.
   command = plan
 
   variables {
@@ -756,8 +745,6 @@ run "nginx_mode_cert_renew_retries_first_issuance" {
     error_message = "cert-renew must still run certbot renew once a lineage exists"
   }
 
-  # The host script's retry and the sidecar's boot-time issuance must issue the
-  # same certificate: one shared argument string, rendered into both.
   assert {
     condition     = length(regexall("certbot certonly --webroot -w /var/www/certbot -d terrateam.example.com --email ops@example.com --agree-tos --non-interactive", aws_instance.this.user_data)) == 2
     error_message = "the certonly invocation must appear exactly twice (sidecar + host retry) with identical arguments"
@@ -765,10 +752,6 @@ run "nginx_mode_cert_renew_retries_first_issuance" {
 }
 
 run "nginx_mode_user_data_fits_ec2_limit_with_long_hostname" {
-  # EC2 caps user_data at 16384 bytes and nginx_letsencrypt renders the largest
-  # cloud-config (compose + nginx.conf + cert bootstrap + renew script), with the
-  # hostname repeated throughout. Pin the headroom with a long hostname so a
-  # comment or script addition can't push real deployments over the limit.
   command = plan
 
   variables {

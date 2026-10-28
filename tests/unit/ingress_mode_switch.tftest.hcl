@@ -135,9 +135,6 @@ run "switch_to_nginx_letsencrypt" {
 }
 
 run "drop_route53_zone_keeps_everything_else" {
-  # The update path for the toggle: handing DNS back to the caller removes only
-  # the record. The instance (and so the EIP association) must survive untouched,
-  # which is why the record targets the EIP rather than the instance's address.
   command = apply
 
   variables {
