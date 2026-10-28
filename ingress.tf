@@ -31,3 +31,19 @@ resource "aws_eip_association" "this" {
   instance_id   = aws_instance.this.id
   allocation_id = var.eip_allocation_id
 }
+
+data "aws_eip" "this" {
+  count = var.route53_zone_id != null ? 1 : 0
+  id    = var.eip_allocation_id
+}
+
+resource "aws_route53_record" "this" {
+  count   = var.route53_zone_id != null ? 1 : 0
+  zone_id = var.route53_zone_id
+  name    = var.hostname
+  type    = "A"
+  ttl     = 60
+  records = [data.aws_eip.this[0].public_ip]
+
+  allow_overwrite = false
+}

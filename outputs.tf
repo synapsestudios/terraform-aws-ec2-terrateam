@@ -4,8 +4,13 @@ output "instance_id" {
 }
 
 output "public_ip" {
-  description = "Public IP of the Terrateam instance. In cloudflare_tunnel mode this is an egress address only (ingress is via the tunnel). In nginx_letsencrypt mode the caller's associated Elastic IP is the inbound address; point the DNS A record at the EIP, not at this value."
+  description = "Public IP of the Terrateam instance. In cloudflare_tunnel mode this is an egress address only (ingress is via the tunnel). In nginx_letsencrypt mode the caller's associated Elastic IP is the inbound address; a DNS A record (the caller's, or the module's when route53_zone_id is set) points at the EIP, never at this value."
   value       = aws_instance.this.public_ip
+}
+
+output "route53_record_fqdn" {
+  description = "FQDN of the Route 53 A record the module manages for hostname (nginx_letsencrypt mode with route53_zone_id). Null when the caller owns the DNS record."
+  value       = one(aws_route53_record.this[*].fqdn)
 }
 
 output "security_group_id" {
