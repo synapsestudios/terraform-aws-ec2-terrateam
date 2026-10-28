@@ -60,7 +60,7 @@ module "terrateam" {
 | Public edge | Cloudflare (DDoS shielding + WAF) | **None** — host is directly internet-exposed |
 | TLS | Terminated at Cloudflare's edge | nginx on the host, **Let's Encrypt** cert (certbot, HTTP-01) |
 | Ingress container(s) | `cloudflared` | `nginx` + `certbot` |
-| Caller must provide | Cloudflare Tunnel resource + connector token (SSM) | A caller-owned **Elastic IP** (`eip_allocation_id`) + a DNS **A record** pointing at it |
+| Caller must provide | Cloudflare Tunnel resource + connector token (SSM) | A caller-owned **Elastic IP** (`eip_allocation_id`), plus either a DNS **A record** pointing at it or a Route 53 hosted zone (`route53_zone_id`) for the module to create one in |
 | `terrat-oss` exposure | Published to `127.0.0.1:8080` for cloudflared | Internal-only (`expose`); only nginx reaches it |
 
 ### ⚠️ Security trade-off (opt-in)
@@ -69,7 +69,9 @@ The "no ingress — reachable only via Cloudflare Tunnel" posture is a deliberat
 
 ### Switching modes
 
-Changing `ingress_mode` on an existing deployment **recreates the instance** (the module sets `user_data_replace_on_change = true`, because cloud-init only runs at first boot — a stop/start would leave the host on the old ingress stack). The recreate is non-destructive to durable state: Postgres data is on the caller's EBS volume, and `nginx_letsencrypt` keeps its caller-owned EIP + DNS A record, so the public address is stable across the switch. Switching to `nginx_letsencrypt` requires adding `eip_allocation_id` (and dropping the now-unused tunnel-token parameter); switching back requires the reverse. Same applies to image-tag bumps — they take effect by recreating the host, not in place.
+Changing `ingress_mode` on an existing deployment **recreates the instance** (the module sets `user_data_replace_on_change = true`, because cloud-init only runs at first boot — a stop/start would leave the host on the old ingress stack). The recreate is non-destructive to durable state: Postgres data is on the caller's EBS volume, and `nginx_letsencrypt` keeps its caller-owned EIP + DNS A record, so the public address is stable across the switch. Switching to `nginx_letsencrypt` requires adding `eip_allocation_id` (and dropping the now-unused tunnel-token parameter); switching back requires the reverse, and drops the module's Route 53 record if `route53_zone_id` was set. Same applies to image-tag bumps — they take effect by recreating the host, not in place.
+
+Adding `route53_zone_id` to a deployment that already has a hand-made A record for the hostname does not recreate anything, but the record is created with `allow_overwrite = false`, so the apply fails while the old record exists. Either `terraform import` the existing record into `module.<name>.aws_route53_record.this[0]` or delete it first. Removing `route53_zone_id` later deletes the module's record and touches nothing else.
 
 ### Using `nginx_letsencrypt`
 
@@ -80,7 +82,7 @@ module "terrateam" {
   ingress_mode = "nginx_letsencrypt"
 
   namespace      = "acme-prod"
-  hostname       = "terrateam.acme.example" # must resolve (A record) to the EIP below
+  hostname       = "terrateam.acme.example" # A record for this name -> the EIP below
   github_app_url = "https://github.com/apps/terrateam-acme"
 
   vpc_id           = module.vpc.vpc_id
@@ -92,6 +94,10 @@ module "terrateam" {
   # and Let's Encrypt issuance both depend on a stable IP).
   eip_allocation_id = aws_eip.terrateam.allocation_id
   acme_email        = "ops@acme.example" # optional; Let's Encrypt expiry notices
+
+  # Optional: hand the module a same-account hosted zone and it creates the
+  # A record for hostname -> EIP. Omit it to manage the record yourself.
+  route53_zone_id = aws_route53_zone.acme.zone_id
 
   # No tunnel token in this mode — drop it from both lists.
   ssm_parameter_arns = [
@@ -116,7 +122,7 @@ module "terrateam" {
 }
 ```
 
-The DNS A record must resolve to the EIP **before** first boot — certbot's HTTP-01 challenge needs the hostname to reach the host on port 80. nginx starts immediately on a self-signed placeholder so it never blocks on issuance; the certbot sidecar then obtains the real cert, and a host `terrateam-cert-renew.timer` (twice daily) renews it and reloads nginx. If first-boot issuance fails (e.g. DNS not yet propagated), nginx keeps serving the placeholder and the cert is reissued on the next instance replacement.
+The hostname must resolve to the EIP for certbot's HTTP-01 challenge to reach the host on port 80. With `route53_zone_id` set, the module creates that A record (TTL 60, pointing at the EIP, not the instance address) at the start of the apply, in parallel with the instance, so it is normally live well before cloud-init reaches certbot. Without it, create the record yourself before first boot. nginx starts immediately on a self-signed placeholder so it never blocks on issuance; the certbot sidecar then obtains the real cert, and a host `terrateam-cert-renew.timer` (5 minutes after boot, then twice daily) renews it and reloads nginx. If first-boot issuance fails (e.g. DNS not yet propagated), nginx keeps serving the placeholder and the timer retries issuance until a certificate exists, well within Let's Encrypt's rate limits.
 
 > **Certificate persistence:** Let's Encrypt certs live on the instance's root volume and do **not** survive instance replacement — a fresh cert is issued on replacement (well within Let's Encrypt rate limits). This is intentional for v1.
 
@@ -126,7 +132,7 @@ The DNS A record must resolve to the EIP **before** first boot — certbot's HTT
 
 - The `aws_instance`, with caller-supplied AMI and `lifecycle { ignore_changes = [ami] }` so AL2023 AMI rotations don't churn the host.
 - A security group: egress anywhere, and ingress per `ingress_mode` — **no ingress** in `cloudflare_tunnel` mode (reachable only via the caller's tunnel), or **80 + 443** open in `nginx_letsencrypt` mode.
-- In `nginx_letsencrypt` mode, the `aws_eip_association` binding the caller's Elastic IP to the instance (the module does not create the EIP — the caller owns it).
+- In `nginx_letsencrypt` mode, the `aws_eip_association` binding the caller's Elastic IP to the instance (the module does not create the EIP — the caller owns it), and, when `route53_zone_id` is set, the Route 53 **A record** for `hostname` pointing at that EIP.
 - An IAM role + instance profile scoped to: read the SSM parameters the caller passes in (`var.ssm_parameter_arns`), write to `${var.log_group_prefix}/*` log groups under the caller's account, and operate as an SSM-managed instance for SSH-less ops.
 - The cloud-init user-data: installs Docker + compose plugin + CloudWatch Agent, mounts the data EBS volume by **NVMe serial** (reliable on Nitro), drops a render-secrets script + systemd unit that fetches SSM SecureStrings into a root-only `.env`/PEM, writes a pinned `docker-compose.yml`, and runs the stack as a `systemd` unit ordered after the render unit. In `nginx_letsencrypt` mode it also writes the templated `nginx.conf`, a self-signed bootstrap cert, and the `terrateam-cert-renew` timer.
 - The `aws_volume_attachment` for the caller's data EBS volume.
@@ -138,7 +144,7 @@ The DNS A record must resolve to the EIP **before** first boot — certbot's HTT
 - The data EBS volume (so it survives instance replacement).
 - The DLM lifecycle policy that snapshots the data volume.
 - **`cloudflare_tunnel` mode:** the Cloudflare Tunnel resource that produces the connector token, and the DNS record that points at the tunnel.
-- **`nginx_letsencrypt` mode:** the Elastic IP (`aws_eip`, passed as `eip_allocation_id`) and the DNS **A record** pointing at it.
+- **`nginx_letsencrypt` mode:** the Elastic IP (`aws_eip`, passed as `eip_allocation_id`), the hosted zone if `route53_zone_id` is set, and otherwise the DNS **A record** pointing at the EIP.
 - The SSM parameters (the module only sees ARN references and parameter names — never the values): seven in `cloudflare_tunnel` mode, or six in `nginx_letsencrypt` mode (no tunnel token).
 
 ## Inputs
@@ -147,6 +153,7 @@ See `variables.tf`. The most consequential ones:
 
 - `ingress_mode` — `cloudflare_tunnel` (default) or `nginx_letsencrypt`. See [Ingress modes](#ingress-modes).
 - `eip_allocation_id` — caller-owned Elastic IP allocation. **Required in `nginx_letsencrypt` mode**, unused otherwise.
+- `route53_zone_id` — optional same-account Route 53 hosted zone (`nginx_letsencrypt` mode only); when set, the module creates the A record for `hostname`. A zone in another account needs a second provider and is not supported; keep owning the record yourself in that case.
 - `acme_email` — optional Let's Encrypt registration email (`nginx_letsencrypt` mode); omit to register without one.
 - `data_volume_id` — must already exist; module attaches it and discovers it via NVMe serial.
 - `ssm_parameter_arns` — the IAM role is scoped to exactly these.
@@ -156,7 +163,7 @@ See `variables.tf`. The most consequential ones:
 
 ## Outputs
 
-`instance_id`, `public_ip`, `security_group_id`, `iam_role_arn`, `iam_role_name`.
+`instance_id`, `public_ip`, `security_group_id`, `iam_role_arn`, `iam_role_name`, and `route53_record_fqdn` (null unless the module manages the record).
 
 ## Running tests
 
