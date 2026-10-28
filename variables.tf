@@ -20,7 +20,7 @@ variable "ingress_mode" {
 }
 
 variable "eip_allocation_id" {
-  description = "Allocation ID of a caller-owned Elastic IP to associate with the instance. Required (and only used) when ingress_mode = \"nginx_letsencrypt\": it provides a stable public IP that survives instance replacement, which the caller points a DNS A record at for Let's Encrypt issuance. The caller owns the aws_eip and the DNS record (mirrors the data-volume/DNS ownership boundary)."
+  description = "Allocation ID of a caller-owned Elastic IP to associate with the instance. Required (and only used) when ingress_mode = \"nginx_letsencrypt\": it provides a stable public IP that survives instance replacement, which the DNS A record for hostname points at for Let's Encrypt issuance. The caller owns the aws_eip (mirrors the data-volume ownership boundary); the A record is the caller's too unless route53_zone_id is set, in which case the module creates it against this EIP."
   type        = string
   default     = null
   validation {
@@ -30,8 +30,18 @@ variable "eip_allocation_id" {
 }
 
 variable "hostname" {
-  description = "Public hostname terrateam is served at. Used as TERRAT_UI_BASE / TERRAT_WEB_BASE_URL inside the container; the GitHub App's OAuth callback URL must point here."
+  description = "Public hostname terrateam is served at. Used as TERRAT_UI_BASE / TERRAT_WEB_BASE_URL inside the container; the GitHub App's OAuth callback URL must point here. In nginx_letsencrypt mode it must resolve (A record) to the Elastic IP; set route53_zone_id to have the module create that record."
   type        = string
+}
+
+variable "route53_zone_id" {
+  description = "ID of a same-account Route 53 hosted zone in which the module creates an A record for hostname pointing at the Elastic IP (ingress_mode = \"nginx_letsencrypt\" only). Leave null to own the DNS record yourself. The record is created with allow_overwrite = false, so an existing hand-made record must be imported or deleted first."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.route53_zone_id == null || var.ingress_mode == "nginx_letsencrypt"
+    error_message = "route53_zone_id is only supported when ingress_mode = \"nginx_letsencrypt\" (a Cloudflare Tunnel hostname must be a Cloudflare-proxied record)."
+  }
 }
 
 variable "github_app_url" {

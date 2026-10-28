@@ -31,3 +31,31 @@ resource "aws_eip_association" "this" {
   instance_id   = aws_instance.this.id
   allocation_id = var.eip_allocation_id
 }
+
+# Optional Route 53 A record for var.hostname, only when the caller hands over a
+# hosted zone. It targets the EIP (looked up from the allocation id the module
+# already receives), not aws_instance.this.public_ip: the EIP exists before the
+# apply starts, so the record is created in parallel with the instance and is
+# never touched by instance replacement — which user_data_replace_on_change
+# forces on every mode switch and image bump. Pointing at the instance would
+# re-point DNS only after the new host had already run certbot once.
+#
+# A plain A record with a TTL is the only option for a single host: Route 53
+# alias records cannot target an IP address. allow_overwrite is false (its
+# default, stated explicitly) so the module never silently replaces a hand-made
+# record: a caller adopting route53_zone_id over one must import or delete it.
+data "aws_eip" "this" {
+  count = var.route53_zone_id != null ? 1 : 0
+  id    = var.eip_allocation_id
+}
+
+resource "aws_route53_record" "this" {
+  count   = var.route53_zone_id != null ? 1 : 0
+  zone_id = var.route53_zone_id
+  name    = var.hostname
+  type    = "A"
+  ttl     = 60
+  records = [data.aws_eip.this[0].public_ip]
+
+  allow_overwrite = false
+}

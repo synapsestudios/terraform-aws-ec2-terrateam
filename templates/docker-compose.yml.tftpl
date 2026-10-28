@@ -65,24 +65,24 @@ services:
     volumes:
       - /opt/terrateam/letsencrypt:/etc/letsencrypt
       - /opt/terrateam/acme-webroot:/var/www/certbot
-    # Initial issuance only; renewal is the host systemd timer (cert expiry has no
-    # event source). '|| true; sleep infinity' keeps the sidecar from crash-looping
-    # if issuance fails (e.g. DNS not yet resolvable) — nginx stays up on its
-    # self-signed bootstrap cert and the host timer retries renewal once a cert exists.
+    # One issuance attempt at boot, then idle holding the mounts for `compose exec`.
+    # '|| true; sleep infinity' avoids a crash loop if issuance fails (DNS not live
+    # yet?); the host cert-renew timer retries certonly with the same args.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        # $$ is a literal $ to compose (it interpolates $VAR itself otherwise).
         # No renewal config yet => first boot. Clear the host's self-signed
         # placeholder so certbot owns the lineage cleanly (avoids a -0001 suffix).
-        if [ ! -f /etc/letsencrypt/renewal/${hostname}.conf ]; then
-          rm -rf /etc/letsencrypt/live/${hostname} /etc/letsencrypt/archive/${hostname}
+        h=${hostname}; d=/etc/letsencrypt/live/$$h
+        if [ ! -f /etc/letsencrypt/renewal/$$h.conf ]; then
+          rm -rf "$$d" /etc/letsencrypt/archive/$$h
         fi
-        certbot certonly --webroot -w /var/www/certbot -d ${hostname} ${certbot_email_arg} --agree-tos --non-interactive || true
-        # If issuance failed (e.g. DNS not resolvable yet), restore a placeholder so
-        # nginx keeps serving :443; the host renew timer retries later.
-        if [ ! -f /etc/letsencrypt/live/${hostname}/fullchain.pem ]; then
-          mkdir -p /etc/letsencrypt/live/${hostname}
-          openssl req -x509 -nodes -newkey rsa:2048 -days 1 -keyout /etc/letsencrypt/live/${hostname}/privkey.pem -out /etc/letsencrypt/live/${hostname}/fullchain.pem -subj "/CN=${hostname}"
+        certbot certonly ${certbot_certonly_args} || true
+        # Issuance failed: restore a placeholder so nginx keeps serving :443.
+        if [ ! -f "$$d/fullchain.pem" ]; then
+          mkdir -p "$$d"
+          openssl req -x509 -nodes -newkey rsa:2048 -days 1 -keyout "$$d/privkey.pem" -out "$$d/fullchain.pem" -subj "/CN=$$h"
         fi
         sleep infinity
 %{ endif ~}

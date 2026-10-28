@@ -22,6 +22,11 @@ mock_provider "aws" {
       name = "us-west-2"
     }
   }
+  mock_data "aws_eip" {
+    defaults = {
+      public_ip = "203.0.113.10"
+    }
+  }
 }
 
 variables {
@@ -91,6 +96,7 @@ run "switch_to_nginx_letsencrypt" {
   variables {
     ingress_mode      = "nginx_letsencrypt"
     eip_allocation_id = "eipalloc-0123456789abcdef0"
+    route53_zone_id   = "Z0123456789ABCDEFGHIJ"
     acme_email        = "ops@example.com"
     user_data_inputs = {
       github_app_id_param            = "/terrateam/github-app-id"
@@ -121,6 +127,48 @@ run "switch_to_nginx_letsencrypt" {
     condition     = !strcontains(aws_instance.this.user_data, "cloudflare/cloudflared:") && !strcontains(aws_instance.this.user_data, "127.0.0.1:8080:8080")
     error_message = "after switching to nginx_letsencrypt, cloudflared and the loopback publish must be gone"
   }
+
+  assert {
+    condition     = length(aws_route53_record.this) == 1 && aws_route53_record.this[0].records == toset(["203.0.113.10"])
+    error_message = "switching to nginx_letsencrypt with route53_zone_id must create the A record for the EIP"
+  }
+}
+
+run "drop_route53_zone_keeps_everything_else" {
+  # The update path for the toggle: handing DNS back to the caller removes only
+  # the record. The instance (and so the EIP association) must survive untouched,
+  # which is why the record targets the EIP rather than the instance's address.
+  command = apply
+
+  variables {
+    ingress_mode      = "nginx_letsencrypt"
+    eip_allocation_id = "eipalloc-0123456789abcdef0"
+    route53_zone_id   = null
+    acme_email        = "ops@example.com"
+    user_data_inputs = {
+      github_app_id_param            = "/terrateam/github-app-id"
+      github_app_pem_param           = "/terrateam/github-app-pem"
+      github_app_client_id_param     = "/terrateam/github-app-client-id"
+      github_app_client_secret_param = "/terrateam/github-app-client-secret"
+      webhook_secret_param           = "/terrateam/github-webhook-secret"
+      postgres_password_param        = "/terrateam/postgres-password"
+    }
+  }
+
+  assert {
+    condition     = length(aws_route53_record.this) == 0 && output.route53_record_fqdn == null
+    error_message = "dropping route53_zone_id must remove the module-managed record"
+  }
+
+  assert {
+    condition     = length(aws_eip_association.this) == 1
+    error_message = "dropping route53_zone_id must keep the EIP association (DNS ownership is independent of ingress)"
+  }
+
+  assert {
+    condition     = output.instance_id == run.switch_to_nginx_letsencrypt.instance_id
+    error_message = "dropping route53_zone_id must not replace the instance: the record is not an input to user_data"
+  }
 }
 
 run "switch_back_to_cloudflare_tunnel" {
@@ -150,6 +198,11 @@ run "switch_back_to_cloudflare_tunnel" {
   assert {
     condition     = length(aws_eip_association.this) == 0
     error_message = "switching back to cloudflare_tunnel must release the EIP association"
+  }
+
+  assert {
+    condition     = length(aws_route53_record.this) == 0
+    error_message = "switching back to cloudflare_tunnel must remove the Route 53 record (the tunnel hostname is a Cloudflare-proxied record)"
   }
 
   assert {

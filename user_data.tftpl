@@ -213,11 +213,22 @@ write_files:
       log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
       log "cert-renew: start"
       cd /opt/terrateam
-      # Renew due certs (no-op until ~30 days before expiry); the certbot sidecar
-      # holds the webroot + /etc/letsencrypt mounts and the per-cert renewal config.
-      docker compose exec -T certbot certbot renew --quiet || log "certbot renew returned non-zero"
-      # Reload nginx unconditionally: graceful and cheap, and also picks up the first
-      # real cert the boot-time sidecar issued (renew alone won't reload a fresh cert).
+      le=/opt/terrateam/letsencrypt; h=${hostname}
+      if [ -f "$le/renewal/$h.conf" ]; then
+        # Renew due certs (no-op until ~30 days before expiry).
+        docker compose exec -T certbot certbot renew --quiet || log "certbot renew returned non-zero"
+      else
+        # No lineage (boot-time issuance failed, e.g. DNS not live yet): renew would
+        # no-op forever, so retry certonly. Clear the placeholder first; restore it on failure.
+        log "no lineage for $h; retrying first issuance"
+        rm -rf "$le/live/$h" "$le/archive/$h"
+        docker compose exec -T certbot certbot certonly ${certbot_certonly_args} || log "certbot certonly returned non-zero"
+        if [ ! -f "$le/live/$h/fullchain.pem" ]; then
+          mkdir -p "$le/live/$h"
+          openssl req -x509 -nodes -newkey rsa:2048 -days 1 -keyout "$le/live/$h/privkey.pem" -out "$le/live/$h/fullchain.pem" -subj "/CN=$h"
+        fi
+      fi
+      # Reload nginx unconditionally: graceful, cheap, and picks up a fresh cert.
       docker compose exec -T nginx nginx -s reload || log "nginx reload returned non-zero"
       log "cert-renew: done"
 
@@ -267,11 +278,9 @@ runcmd:
   # shared ACME webroot + cert dirs and drop a 1-day self-signed placeholder at
   # the live cert path. The certbot sidecar replaces it with the real Let's
   # Encrypt cert (or restores the placeholder if issuance fails).
-  - install -d -m 0755 /opt/terrateam/acme-webroot
-  - install -d -m 0755 /opt/terrateam/nginx-logs
+  - install -d -m 0755 /opt/terrateam/acme-webroot /opt/terrateam/nginx-logs
   - install -d -m 0700 /opt/terrateam/letsencrypt
-  - install -d -m 0755 /opt/terrateam/letsencrypt/live/${hostname}
-  - if [ ! -f /opt/terrateam/letsencrypt/live/${hostname}/fullchain.pem ]; then openssl req -x509 -nodes -newkey rsa:2048 -days 1 -keyout /opt/terrateam/letsencrypt/live/${hostname}/privkey.pem -out /opt/terrateam/letsencrypt/live/${hostname}/fullchain.pem -subj "/CN=${hostname}"; fi
+  - d=/opt/terrateam/letsencrypt/live/${hostname}; install -d -m 0755 "$d"; if [ ! -f "$d/fullchain.pem" ]; then openssl req -x509 -nodes -newkey rsa:2048 -days 1 -keyout "$d/privkey.pem" -out "$d/fullchain.pem" -subj "/CN=${hostname}"; fi
 %{ endif ~}
   - systemctl enable --now terrateam-render-secrets.service terrateam.service
 %{ if ingress_mode == "nginx_letsencrypt" ~}

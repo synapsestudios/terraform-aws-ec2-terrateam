@@ -17,6 +17,17 @@ locals {
 
   cw_log_group_name = "${var.log_group_prefix}/render-secrets"
 
+  # Arguments for `certbot certonly`, defined once because two places issue the
+  # certificate: the certbot sidecar at boot, and the host cert-renew timer when
+  # it finds no lineage (a retry for a first issuance that failed, e.g. because
+  # DNS was not live yet). One string keeps the two from drifting. The
+  # registration flag is --email when acme_email is set, else unattended.
+  certbot_certonly_args = join(" ", [
+    "--webroot -w /var/www/certbot -d ${var.hostname}",
+    var.acme_email != null ? "--email ${var.acme_email}" : "--register-unsafely-without-email",
+    "--agree-tos --non-interactive",
+  ])
+
   # The compose stack is rendered from its own template fragment and injected
   # into the cloud-config below. Keeping it out of user_data.tftpl isolates the
   # ingress-specific services (cloudflared today; nginx + certbot under
@@ -29,9 +40,7 @@ locals {
     certbot_image_tag     = var.certbot_image_tag
     github_app_url        = var.github_app_url
     hostname              = var.hostname
-    # Precompute the certbot registration flag so the compose template stays free
-    # of conditionals: --email when acme_email is set, else unattended registration.
-    certbot_email_arg = var.acme_email != null ? "--email ${var.acme_email}" : "--register-unsafely-without-email"
+    certbot_certonly_args = local.certbot_certonly_args
   })
 
   # nginx reverse-proxy config, rendered only in nginx_letsencrypt mode and
@@ -139,6 +148,7 @@ resource "aws_instance" "this" {
     ingress_mode                   = var.ingress_mode
     hostname                       = var.hostname
     nginx_conf                     = local.nginx_conf
+    certbot_certonly_args          = local.certbot_certonly_args
     tunnel_token_param_name        = var.user_data_inputs.tunnel_token_param_name
     github_app_id_param            = var.user_data_inputs.github_app_id_param
     github_app_pem_param           = var.user_data_inputs.github_app_pem_param
@@ -153,6 +163,10 @@ resource "aws_instance" "this" {
     compose_yml                    = local.compose_yml
   })
 
+  # EC2 caps user_data at 16384 bytes and nginx_letsencrypt mode renders close
+  # to it (the unit suite pins the headroom with a long hostname). Comments
+  # inside the templates ship to the instance, so keep them short.
+  #
   # Recreate (not the default stop/start) when user_data changes, so cloud-init
   # actually re-runs the new config — e.g. an ingress_mode switch or an image-tag
   # bump. Durable state survives the recreate: Postgres lives on the external EBS

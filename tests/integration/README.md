@@ -18,6 +18,7 @@ The probe is an `aws_ssm_association` running `AWS-RunShellScript` inside the in
 
 - The Cloudflare Tunnel path. `cloudflared` fails to authenticate against the placeholder token and restarts in a loop; the probe runs against `localhost:8080` on the instance, bypassing the tunnel.
 - The actual GitHub App webhook flow. The placeholders aren't real credentials.
+- The module-managed Route 53 record. The lane runs with `route53_zone_id = null`: the test account has no hosted zone, the hostname is `terrateam.test.invalid`, and the external probe uses `curl --resolve` to stand in for DNS. A real-DNS lane that creates the record in a test zone and completes issuance against the Let's Encrypt staging endpoint is a follow-up once that zone exists.
 
 ## Running
 

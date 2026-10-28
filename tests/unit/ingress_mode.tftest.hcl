@@ -19,6 +19,13 @@ mock_provider "aws" {
       name = "us-west-2"
     }
   }
+  # Pin the EIP's address so the Route 53 record assertions can check that the
+  # module wires the looked-up IP (not a random mock string) into the record.
+  mock_data "aws_eip" {
+    defaults = {
+      public_ip = "203.0.113.10"
+    }
+  }
 }
 
 variables {
@@ -294,6 +301,13 @@ run "nginx_mode_compose_runs_nginx_and_certbot" {
     condition     = strcontains(aws_instance.this.user_data, "--email ops@example.com")
     error_message = "certbot must register with the supplied acme_email"
   }
+
+  # Compose interpolates $VAR in command strings from its own environment, so the
+  # sidecar's shell variables must be written as $$VAR to reach the shell intact.
+  assert {
+    condition     = strcontains(aws_instance.this.user_data, "h=terrateam.example.com; d=/etc/letsencrypt/live/$$h") && !strcontains(aws_instance.this.user_data, "/etc/letsencrypt/live/$h")
+    error_message = "the certbot sidecar script must escape its shell variables as $$h / $$d so docker compose does not interpolate them to empty strings"
+  }
 }
 
 run "nginx_mode_without_acme_email_registers_unattended" {
@@ -489,6 +503,11 @@ run "tunnel_mode_has_no_cert_renew_timer" {
   }
 
   assert {
+    condition     = !strcontains(aws_instance.this.user_data, "certbot certonly")
+    error_message = "cloudflare_tunnel mode must not carry the first-issuance retry (no certs to issue)"
+  }
+
+  assert {
     condition     = !strcontains(aws_instance.this.user_data, "nginx-logs")
     error_message = "cloudflare_tunnel mode must not collect nginx logs"
   }
@@ -563,5 +582,212 @@ run "nginx_mode_user_data_is_valid_cloud_init" {
   assert {
     condition     = can(yamldecode(aws_instance.this.user_data))
     error_message = "nginx_letsencrypt user-data must remain valid cloud-init YAML"
+  }
+}
+
+run "route53_zone_id_rejected_in_tunnel_mode" {
+  command = plan
+
+  variables {
+    route53_zone_id = "Z0123456789ABCDEFGHIJ"
+  }
+
+  expect_failures = [var.route53_zone_id]
+}
+
+run "no_route53_record_in_tunnel_mode" {
+  command = plan
+
+  assert {
+    condition     = length(aws_route53_record.this) == 0
+    error_message = "cloudflare_tunnel mode must not create a Route 53 record (the tunnel hostname is a Cloudflare-proxied record the caller owns)"
+  }
+
+  assert {
+    condition     = length(data.aws_eip.this) == 0
+    error_message = "cloudflare_tunnel mode must not look up an EIP (there is none)"
+  }
+}
+
+run "no_route53_record_in_nginx_mode_without_zone" {
+  command = plan
+
+  variables {
+    ingress_mode      = "nginx_letsencrypt"
+    eip_allocation_id = "eipalloc-0123456789abcdef0"
+    user_data_inputs = {
+      github_app_id_param            = "/terrateam/github-app-id"
+      github_app_pem_param           = "/terrateam/github-app-pem"
+      github_app_client_id_param     = "/terrateam/github-app-client-id"
+      github_app_client_secret_param = "/terrateam/github-app-client-secret"
+      webhook_secret_param           = "/terrateam/github-webhook-secret"
+      postgres_password_param        = "/terrateam/postgres-password"
+    }
+  }
+
+  assert {
+    condition     = length(aws_route53_record.this) == 0
+    error_message = "nginx_letsencrypt without route53_zone_id must leave DNS to the caller, so existing deployments are unchanged"
+  }
+
+  assert {
+    condition     = length(data.aws_eip.this) == 0
+    error_message = "the EIP lookup exists only to feed the Route 53 record; without a zone there is nothing to look up"
+  }
+
+  assert {
+    condition     = output.route53_record_fqdn == null
+    error_message = "route53_record_fqdn must be null when the module does not manage the record"
+  }
+}
+
+run "route53_record_points_at_eip_in_nginx_mode" {
+  command = plan
+
+  variables {
+    ingress_mode      = "nginx_letsencrypt"
+    eip_allocation_id = "eipalloc-0123456789abcdef0"
+    route53_zone_id   = "Z0123456789ABCDEFGHIJ"
+    user_data_inputs = {
+      github_app_id_param            = "/terrateam/github-app-id"
+      github_app_pem_param           = "/terrateam/github-app-pem"
+      github_app_client_id_param     = "/terrateam/github-app-client-id"
+      github_app_client_secret_param = "/terrateam/github-app-client-secret"
+      webhook_secret_param           = "/terrateam/github-webhook-secret"
+      postgres_password_param        = "/terrateam/postgres-password"
+    }
+  }
+
+  assert {
+    condition     = length(aws_route53_record.this) == 1
+    error_message = "nginx_letsencrypt with route53_zone_id must create exactly one Route 53 record"
+  }
+
+  assert {
+    condition     = aws_route53_record.this[0].zone_id == "Z0123456789ABCDEFGHIJ"
+    error_message = "the record must be created in the caller's hosted zone"
+  }
+
+  assert {
+    condition     = aws_route53_record.this[0].type == "A" && aws_route53_record.this[0].name == var.hostname
+    error_message = "the record must be an A record for var.hostname (an alias cannot target an IP, so a plain A record is the only option for a single host)"
+  }
+
+  assert {
+    condition     = aws_route53_record.this[0].ttl == 60
+    error_message = "the record must use a 60s TTL so a re-pointed EIP propagates quickly"
+  }
+
+  assert {
+    condition     = aws_route53_record.this[0].records == toset(["203.0.113.10"])
+    error_message = "the record must point at the Elastic IP's public address (looked up from eip_allocation_id), not the instance's own public_ip, so instance replacement never touches DNS"
+  }
+
+  assert {
+    condition     = data.aws_eip.this[0].id == "eipalloc-0123456789abcdef0"
+    error_message = "the EIP lookup must use the caller-supplied allocation id"
+  }
+
+  assert {
+    condition     = aws_route53_record.this[0].allow_overwrite == false
+    error_message = "allow_overwrite must stay false so the module never silently clobbers a hand-made record"
+  }
+}
+
+run "route53_record_fqdn_output_in_nginx_mode_with_zone" {
+  # apply (not plan): fqdn is computed by the provider from the zone's domain and
+  # is unknown until the record exists, so a plan-time assertion can't evaluate.
+  command = apply
+
+  variables {
+    ingress_mode      = "nginx_letsencrypt"
+    eip_allocation_id = "eipalloc-0123456789abcdef0"
+    route53_zone_id   = "Z0123456789ABCDEFGHIJ"
+    user_data_inputs = {
+      github_app_id_param            = "/terrateam/github-app-id"
+      github_app_pem_param           = "/terrateam/github-app-pem"
+      github_app_client_id_param     = "/terrateam/github-app-client-id"
+      github_app_client_secret_param = "/terrateam/github-app-client-secret"
+      webhook_secret_param           = "/terrateam/github-webhook-secret"
+      postgres_password_param        = "/terrateam/postgres-password"
+    }
+  }
+
+  assert {
+    condition     = output.route53_record_fqdn == aws_route53_record.this[0].fqdn
+    error_message = "route53_record_fqdn must expose the managed record's FQDN so callers can wire it into the GitHub App URLs"
+  }
+}
+
+run "nginx_mode_cert_renew_retries_first_issuance" {
+  # A missed first issuance (DNS not live when the certbot sidecar ran) never
+  # self-heals with `certbot renew` alone: renew is a no-op with no lineage. The
+  # host timer must fall back to `certonly` until a lineage exists. This matters
+  # more once the module creates the record, because nothing orders certbot
+  # after Route 53 reports the record in sync.
+  command = plan
+
+  variables {
+    ingress_mode      = "nginx_letsencrypt"
+    eip_allocation_id = "eipalloc-0123456789abcdef0"
+    acme_email        = "ops@example.com"
+    user_data_inputs = {
+      github_app_id_param            = "/terrateam/github-app-id"
+      github_app_pem_param           = "/terrateam/github-app-pem"
+      github_app_client_id_param     = "/terrateam/github-app-client-id"
+      github_app_client_secret_param = "/terrateam/github-app-client-secret"
+      webhook_secret_param           = "/terrateam/github-webhook-secret"
+      postgres_password_param        = "/terrateam/postgres-password"
+    }
+  }
+
+  assert {
+    condition     = strcontains(aws_instance.this.user_data, "le=/opt/terrateam/letsencrypt; h=terrateam.example.com") && strcontains(aws_instance.this.user_data, "if [ -f \"$le/renewal/$h.conf\" ]; then")
+    error_message = "cert-renew must decide between first issuance and renewal by checking the hostname's renewal config on the host bind mount"
+  }
+
+  assert {
+    condition     = strcontains(aws_instance.this.user_data, "docker compose exec -T certbot certbot certonly --webroot -w /var/www/certbot -d terrateam.example.com --email ops@example.com --agree-tos --non-interactive")
+    error_message = "cert-renew must run certbot certonly through the sidecar (same webroot, hostname, and registration flags as the boot-time issuance) when no lineage exists"
+  }
+
+  assert {
+    condition     = strcontains(aws_instance.this.user_data, "docker compose exec -T certbot certbot renew --quiet")
+    error_message = "cert-renew must still run certbot renew once a lineage exists"
+  }
+
+  # The host script's retry and the sidecar's boot-time issuance must issue the
+  # same certificate: one shared argument string, rendered into both.
+  assert {
+    condition     = length(regexall("certbot certonly --webroot -w /var/www/certbot -d terrateam.example.com --email ops@example.com --agree-tos --non-interactive", aws_instance.this.user_data)) == 2
+    error_message = "the certonly invocation must appear exactly twice (sidecar + host retry) with identical arguments"
+  }
+}
+
+run "nginx_mode_user_data_fits_ec2_limit_with_long_hostname" {
+  # EC2 caps user_data at 16384 bytes and nginx_letsencrypt renders the largest
+  # cloud-config (compose + nginx.conf + cert bootstrap + renew script), with the
+  # hostname repeated throughout. Pin the headroom with a long hostname so a
+  # comment or script addition can't push real deployments over the limit.
+  command = plan
+
+  variables {
+    ingress_mode      = "nginx_letsencrypt"
+    eip_allocation_id = "eipalloc-0123456789abcdef0"
+    hostname          = "terrateam.infrastructure.acme-corp.example"
+    acme_email        = "platform-operations@acme-corp.example"
+    user_data_inputs = {
+      github_app_id_param            = "/terrateam/github-app-id"
+      github_app_pem_param           = "/terrateam/github-app-pem"
+      github_app_client_id_param     = "/terrateam/github-app-client-id"
+      github_app_client_secret_param = "/terrateam/github-app-client-secret"
+      webhook_secret_param           = "/terrateam/github-webhook-secret"
+      postgres_password_param        = "/terrateam/postgres-password"
+    }
+  }
+
+  assert {
+    condition     = length(aws_instance.this.user_data) <= 16384
+    error_message = "nginx_letsencrypt user_data must stay within EC2's 16384-byte limit for a long hostname (got ${length(aws_instance.this.user_data)} bytes)"
   }
 }
