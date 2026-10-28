@@ -1,10 +1,10 @@
 # AWS EC2 Terrateam
 
-Reusable Terraform module for a single-host, self-hosted [Terrateam](https://terrateam.io) instance — an EC2 in a public subnet running the Terrateam `docker-compose` reference stack (`terrat-oss` + `postgres:14` + an ingress proxy) with Postgres data on a caller-attached EBS volume.
+Terraform module for a self-hosted [Terrateam](https://terrateam.io) instance on one EC2 host. The host sits in a public subnet and runs the Terrateam `docker-compose` reference stack: `terrat-oss`, `postgres:14`, and an ingress proxy. Postgres data lives on an EBS volume the caller owns and attaches.
 
-The module is opinionated on security posture and operational model: IMDSv2 is required, the root volume is encrypted, the IAM role is scoped to just the SSM parameters the caller passes in, and the host enrolls in SSM Session Manager so operators don't need SSH. Secrets land on disk via an idempotent render unit that re-runs on every Parameter Store change via EventBridge — no polling, no manual rotation.
+The module makes several choices for you. IMDSv2 is required. The root volume is encrypted. The IAM role can read only the SSM parameters the caller passes in. The host enrolls in SSM Session Manager, so nobody needs SSH. Secrets reach disk through a render unit that runs at boot and again whenever a Parameter Store value changes, which EventBridge triggers. Nothing polls, and rotation needs no manual step.
 
-How traffic reaches `terrat-oss` is selectable via [`ingress_mode`](#ingress-modes). The default, `cloudflare_tunnel`, keeps the module's headline posture: the security group has **no ingress** and the host is reachable only via the caller's Cloudflare Tunnel. The alternative, `nginx_letsencrypt`, removes the Cloudflare dependency by opening 80/443 and terminating TLS on the host with nginx + Let's Encrypt.
+[`ingress_mode`](#ingress-modes) selects how traffic reaches `terrat-oss`. The default, `cloudflare_tunnel`, leaves the security group with no ingress rules at all, and the host is reachable only through the caller's Cloudflare Tunnel. The alternative, `nginx_letsencrypt`, drops the Cloudflare dependency. It opens ports 80 and 443 and terminates TLS on the host with nginx and a Let's Encrypt certificate.
 
 ## Usage
 
@@ -19,11 +19,11 @@ module "terrateam" {
   vpc_id           = module.vpc.vpc_id
   public_subnet_id = module.vpc.public_subnets[0]
 
-  # Pin AMI explicitly — AL2023 republishes frequently and the module
-  # sets lifecycle { ignore_changes = [ami] } so bumping is opt-in.
+  # Pin the AMI. AL2023 republishes often, and the module sets
+  # lifecycle { ignore_changes = [ami] }, so bumping is opt-in.
   ami_id = "ami-023a34a1153befb51"
 
-  # Caller-owned: survives instance replacement, snapshot via DLM.
+  # Caller-owned. Survives instance replacement; snapshot it with DLM.
   data_volume_id = aws_ebs_volume.terrateam_data.id
 
   ssm_parameter_arns = [
@@ -52,24 +52,24 @@ module "terrateam" {
 
 ## Ingress modes
 
-`ingress_mode` selects how inbound HTTPS reaches `terrat-oss`. It defaults to `cloudflare_tunnel`, so **existing deployers are unaffected**.
+`ingress_mode` selects how inbound HTTPS reaches `terrat-oss`. The default is `cloudflare_tunnel`, so existing deployments keep working without changes.
 
 | | `cloudflare_tunnel` (default) | `nginx_letsencrypt` |
 |---|---|---|
-| Security group | **No ingress** — outbound tunnel only | Opens **80 + 443** to `0.0.0.0/0` |
-| Public edge | Cloudflare (DDoS shielding + WAF) | **None** — host is directly internet-exposed |
-| TLS | Terminated at Cloudflare's edge | nginx on the host, **Let's Encrypt** cert (certbot, HTTP-01) |
-| Ingress container(s) | `cloudflared` | `nginx` + `certbot` |
-| Caller must provide | Cloudflare Tunnel resource + connector token (SSM) | A caller-owned **Elastic IP** (`eip_allocation_id`) + a DNS **A record** pointing at it |
-| `terrat-oss` exposure | Published to `127.0.0.1:8080` for cloudflared | Internal-only (`expose`); only nginx reaches it |
+| Security group | No ingress rules. Only the outbound tunnel. | Opens 80 and 443 to `0.0.0.0/0` |
+| Public edge | Cloudflare, with its DDoS protection and WAF | None. The host faces the internet directly. |
+| TLS | Terminated at Cloudflare's edge | nginx on the host, with a Let's Encrypt certificate from certbot (HTTP-01) |
+| Ingress containers | `cloudflared` | `nginx` and `certbot` |
+| Caller provides | A Cloudflare Tunnel and its connector token in SSM | An Elastic IP (`eip_allocation_id`) and a DNS A record pointing at it |
+| `terrat-oss` exposure | Published on `127.0.0.1:8080` for cloudflared | Compose network only (`expose`). Only nginx can reach it. |
 
-### ⚠️ Security trade-off (opt-in)
+### Security trade-off
 
-The "no ingress — reachable only via Cloudflare Tunnel" posture is a deliberate headline feature. **`nginx_letsencrypt` abandons it**: the host is directly exposed on 80/443 and loses Cloudflare's edge DDoS shielding and WAF. Choose it only when you can't/won't depend on Cloudflare and accept terminating TLS on a directly-exposed host. The default stays `cloudflare_tunnel`.
+A host with no inbound security-group rules is the point of the default mode. `nginx_letsencrypt` gives that up. The host answers on 80 and 443 from anywhere and loses Cloudflare's DDoS protection and WAF. Pick it only when you cannot or will not depend on Cloudflare and are willing to terminate TLS on an internet-facing host. The default stays `cloudflare_tunnel`.
 
 ### Switching modes
 
-Changing `ingress_mode` on an existing deployment **recreates the instance** (the module sets `user_data_replace_on_change = true`, because cloud-init only runs at first boot — a stop/start would leave the host on the old ingress stack). The recreate is non-destructive to durable state: Postgres data is on the caller's EBS volume, and `nginx_letsencrypt` keeps its caller-owned EIP + DNS A record, so the public address is stable across the switch. Switching to `nginx_letsencrypt` requires adding `eip_allocation_id` (and dropping the now-unused tunnel-token parameter); switching back requires the reverse. Same applies to image-tag bumps — they take effect by recreating the host, not in place.
+Changing `ingress_mode` on a running deployment recreates the instance. The module sets `user_data_replace_on_change = true` because cloud-init runs only at first boot. A plain stop and start would leave the host on the old ingress stack. Durable state survives the recreate. Postgres data is on the caller's EBS volume, and in `nginx_letsencrypt` mode the caller's Elastic IP and DNS A record stay put, so the public address does not change. Switching to `nginx_letsencrypt` means adding `eip_allocation_id` and dropping the tunnel-token parameter. Switching back means the reverse. Image-tag bumps work the same way and recreate the host.
 
 ### Using `nginx_letsencrypt`
 
@@ -80,7 +80,7 @@ module "terrateam" {
   ingress_mode = "nginx_letsencrypt"
 
   namespace      = "acme-prod"
-  hostname       = "terrateam.acme.example" # must resolve (A record) to the EIP below
+  hostname       = "terrateam.acme.example" # the DNS A record must point at the EIP below
   github_app_url = "https://github.com/apps/terrateam-acme"
 
   vpc_id           = module.vpc.vpc_id
@@ -88,12 +88,12 @@ module "terrateam" {
   ami_id           = "ami-023a34a1153befb51"
   data_volume_id   = aws_ebs_volume.terrateam_data.id
 
-  # Caller-owned, so the address survives instance replacement (the DNS A record
-  # and Let's Encrypt issuance both depend on a stable IP).
+  # Caller-owned, so the address survives instance replacement. The DNS A record
+  # and Let's Encrypt issuance both depend on a stable IP.
   eip_allocation_id = aws_eip.terrateam.allocation_id
-  acme_email        = "ops@acme.example" # optional; Let's Encrypt expiry notices
+  acme_email        = "ops@acme.example" # optional, for Let's Encrypt expiry notices
 
-  # No tunnel token in this mode — drop it from both lists.
+  # No tunnel token in this mode. Drop it from both lists.
   ssm_parameter_arns = [
     aws_ssm_parameter.github_app_id.arn,
     aws_ssm_parameter.github_app_pem.arn,
@@ -116,65 +116,73 @@ module "terrateam" {
 }
 ```
 
-The DNS A record must resolve to the EIP **before** first boot — certbot's HTTP-01 challenge needs the hostname to reach the host on port 80. nginx starts immediately on a self-signed placeholder so it never blocks on issuance; the certbot sidecar then obtains the real cert, and a host `terrateam-cert-renew.timer` (twice daily) renews it and reloads nginx. If first-boot issuance fails (e.g. DNS not yet propagated), nginx keeps serving the placeholder and the cert is reissued on the next instance replacement.
+The DNS A record must resolve to the Elastic IP before first boot, because certbot's HTTP-01 challenge needs the hostname to reach port 80 on the host. nginx starts right away on a self-signed placeholder certificate, so it never waits on issuance. The certbot sidecar then requests the real certificate, and a host systemd timer, `terrateam-cert-renew.timer`, runs twice a day to renew it and reload nginx. If first-boot issuance fails, for example because DNS has not propagated yet, nginx keeps serving the placeholder. Issuance runs again the next time the certbot container starts, which includes an instance replacement.
 
-> **Certificate persistence:** Let's Encrypt certs live on the instance's root volume and do **not** survive instance replacement — a fresh cert is issued on replacement (well within Let's Encrypt rate limits). This is intentional for v1.
+Certificates live on the instance's root volume and do not survive instance replacement. A replacement requests a fresh certificate. Let's Encrypt allows five certificates per exact hostname set every seven days, so this only matters if you replace the instance more often than that. That is a v1 decision.
 
-> **Renewal uses a systemd timer**, unlike secret rotation (which is EventBridge-driven). Certificate expiry has no event source to react to, so a twice-daily timer is the right tool here — it is not a regression of the module's "no polling" stance.
+Renewal is the one scheduled job on the host. Secret rotation reacts to EventBridge events, but certificate expiry has no event source, so a twice-daily systemd timer covers it.
 
 ## What the module owns
 
-- The `aws_instance`, with caller-supplied AMI and `lifecycle { ignore_changes = [ami] }` so AL2023 AMI rotations don't churn the host.
-- A security group: egress anywhere, and ingress per `ingress_mode` — **no ingress** in `cloudflare_tunnel` mode (reachable only via the caller's tunnel), or **80 + 443** open in `nginx_letsencrypt` mode.
-- In `nginx_letsencrypt` mode, the `aws_eip_association` binding the caller's Elastic IP to the instance (the module does not create the EIP — the caller owns it).
-- An IAM role + instance profile scoped to: read the SSM parameters the caller passes in (`var.ssm_parameter_arns`), write to `${var.log_group_prefix}/*` log groups under the caller's account, and operate as an SSM-managed instance for SSH-less ops.
-- The cloud-init user-data: installs Docker + compose plugin + CloudWatch Agent, mounts the data EBS volume by **NVMe serial** (reliable on Nitro), drops a render-secrets script + systemd unit that fetches SSM SecureStrings into a root-only `.env`/PEM, writes a pinned `docker-compose.yml`, and runs the stack as a `systemd` unit ordered after the render unit. In `nginx_letsencrypt` mode it also writes the templated `nginx.conf`, a self-signed bootstrap cert, and the `terrateam-cert-renew` timer.
-- The `aws_volume_attachment` for the caller's data EBS volume.
-- **Pinned default versions** for the application containers (`terrateam_image_tag`, and `cloudflared_image_tag` / `nginx_image_tag` + `certbot_image_tag` depending on mode). These are inputs with sensible defaults so the AMI-pinning rationale isn't undermined by silently rolling app code on every restart.
-- **Secret-rotation reconciler** (`rotation.tf`): an EventBridge rule on `aws.ssm` / `Parameter Store Change` for the seven `${var.log_group_prefix}/*` parameters, an IAM role for EventBridge → `ssm:SendCommand` scoped to this instance + `AWS-RunShellScript` only, and a target that runs `systemctl start terrateam-render-secrets.service` on the host. Boot- and rotation-time render output land in CW log group `${var.log_group_prefix}/render-secrets`.
+- The `aws_instance`, with a caller-supplied AMI and `lifecycle { ignore_changes = [ami] }`, so AL2023 AMI rotations do not churn the host.
+- A security group. Egress is open. Ingress depends on `ingress_mode`: none in `cloudflare_tunnel` mode, or 80 and 443 in `nginx_letsencrypt` mode.
+- In `nginx_letsencrypt` mode, the `aws_eip_association` that binds the caller's Elastic IP to the instance. The caller creates and owns the EIP itself.
+- An IAM role and instance profile. The role can read the SSM parameters in `ssm_parameter_arns`, describe EC2 volumes and instances, write to log groups under `log_group_prefix` in the caller's account, and act as an SSM-managed instance for SSH-less operations.
+- The cloud-init user data. It installs Docker, the compose plugin, and the CloudWatch agent. It mounts the data volume by NVMe serial, which is stable on Nitro instances. It writes a render-secrets script and systemd unit that fetch the SSM SecureStrings into a root-only `.env` file and PEM file. It writes a pinned `docker-compose.yml` and runs the stack as a systemd unit ordered after the render unit. In `nginx_letsencrypt` mode it also writes the rendered `nginx.conf`, a self-signed bootstrap certificate, and the `terrateam-cert-renew` timer.
+- The `aws_volume_attachment` for the caller's data volume.
+- Pinned default image tags for the containers: `terrateam_image_tag`, plus `cloudflared_image_tag` or `nginx_image_tag` and `certbot_image_tag` depending on mode. Each is an input with a pinned default, so a restart never silently pulls new application code. Pinning the AMI would mean little otherwise.
+- The secret-rotation reconciler in `rotation.tf`. An EventBridge rule matches `Parameter Store Change` events for the parameter names in `user_data_inputs`. An IAM role lets EventBridge call `ssm:SendCommand`, limited to this instance and the `AWS-RunShellScript` document. The target runs `systemctl start terrateam-render-secrets.service` on the host. The render script compares the fetched values with what is on disk and restarts the stack only when something changed.
+- The CloudWatch log group `${log_group_prefix}/render-secrets`, with 365-day retention. Boot-time and rotation-time render output lands there. In `nginx_letsencrypt` mode the CloudWatch agent also ships nginx access and error logs to `${log_group_prefix}/nginx` and renewal output to `${log_group_prefix}/cert-renew`.
 
 ## What the caller owns
 
-- The data EBS volume (so it survives instance replacement).
+- The data EBS volume, so it survives instance replacement.
 - The DLM lifecycle policy that snapshots the data volume.
-- **`cloudflare_tunnel` mode:** the Cloudflare Tunnel resource that produces the connector token, and the DNS record that points at the tunnel.
-- **`nginx_letsencrypt` mode:** the Elastic IP (`aws_eip`, passed as `eip_allocation_id`) and the DNS **A record** pointing at it.
-- The SSM parameters (the module only sees ARN references and parameter names — never the values): seven in `cloudflare_tunnel` mode, or six in `nginx_letsencrypt` mode (no tunnel token).
+- In `cloudflare_tunnel` mode, the Cloudflare Tunnel that produces the connector token, and the DNS record that points at the tunnel.
+- In `nginx_letsencrypt` mode, the Elastic IP passed as `eip_allocation_id`, and the DNS A record pointing at it.
+- The SSM parameters. The module sees only ARNs and names, never values. There are seven in `cloudflare_tunnel` mode and six in `nginx_letsencrypt` mode, which has no tunnel token.
 
 ## Inputs
 
-See `variables.tf`. The most consequential ones:
+See `variables.tf` for the full list. The ones that matter most:
 
-- `ingress_mode` — `cloudflare_tunnel` (default) or `nginx_letsencrypt`. See [Ingress modes](#ingress-modes).
-- `eip_allocation_id` — caller-owned Elastic IP allocation. **Required in `nginx_letsencrypt` mode**, unused otherwise.
-- `acme_email` — optional Let's Encrypt registration email (`nginx_letsencrypt` mode); omit to register without one.
-- `data_volume_id` — must already exist; module attaches it and discovers it via NVMe serial.
-- `ssm_parameter_arns` — the IAM role is scoped to exactly these.
-- `user_data_inputs` — names of the SSM parameters the boot script reads (`tunnel_token_param_name` is optional and omitted in `nginx_letsencrypt` mode).
-- `terrateam_image_tag` / `cloudflared_image_tag` / `nginx_image_tag` / `certbot_image_tag` — defaults are the versions verified by this module; bumping is opt-in.
-- `log_group_prefix` — defaults to `/terrateam`; constrains the IAM `logs:*` scope.
+- `ingress_mode`: `cloudflare_tunnel` (default) or `nginx_letsencrypt`. See [Ingress modes](#ingress-modes).
+- `eip_allocation_id`: a caller-owned Elastic IP allocation. Required in `nginx_letsencrypt` mode and unused otherwise.
+- `acme_email`: optional Let's Encrypt registration email for `nginx_letsencrypt` mode. Omit it to register without one.
+- `data_volume_id`: must already exist. The module attaches it and finds it on the host by NVMe serial.
+- `ssm_parameter_arns`: the IAM role can read exactly these.
+- `user_data_inputs`: names of the SSM parameters the boot script reads. `tunnel_token_param_name` is optional and omitted in `nginx_letsencrypt` mode.
+- `terrateam_image_tag`, `cloudflared_image_tag`, `nginx_image_tag`, `certbot_image_tag`: defaults are the versions this module was tested with. Bumping is opt-in.
+- `log_group_prefix`: defaults to `/terrateam` and bounds the IAM `logs:*` permissions.
 
 ## Outputs
 
 `instance_id`, `public_ip`, `security_group_id`, `iam_role_arn`, `iam_role_name`.
 
+In `cloudflare_tunnel` mode `public_ip` is an egress address only. In `nginx_letsencrypt` mode the caller's Elastic IP is the inbound address, so the DNS A record points at the EIP. `public_ip` is the address the instance received at launch.
+
 ## Running tests
 
-Tests follow the [Synapse Terraform Testing guide](https://docs.synapsestudios.com/implementation/infrastructure/terraform-testing) and use the native `terraform test` framework. The `-test-directory` flag is required on `init` so Terraform discovers modules referenced from test files in non-default directories.
+Tests follow the [Synapse Terraform Testing guide](https://docs.synapsestudios.com/implementation/infrastructure/terraform-testing) and use the native `terraform test` framework.
 
 | Lane | Path | Cost | When it runs |
 |---|---|---|---|
-| Unit | `tests/unit/` | Free — `mock_provider` | Locally, and (once CI is wired) on every PR |
-| Integration | `tests/integration/` | Real AWS — EC2 + EBS for ~15 min | Locally, or via manual dispatch in CI |
+| Unit | `tests/unit/` | Free. Uses `mock_provider`. | Locally, and in CI on every pull request. |
+| Integration | `tests/integration/` | Real AWS. An EC2 instance and EBS volume per test, for roughly 15 minutes each. | Locally, or by manual dispatch in CI. |
+
+The unit lane tests this repo's root module, so pass `-test-directory` on both `init` and `test` to make Terraform find the test files and any modules they reference. The integration suite is its own root module under `tests/integration`, with a VPC, an EBS volume, and SSM parameters wrapped around the module under test, so run it from that directory.
 
 ```bash
-# Unit — no AWS credentials required
+# Unit. No AWS credentials needed.
 terraform init -test-directory=tests/unit
 terraform test -test-directory=tests/unit
 
-# Integration — requires AWS credentials in us-west-2
-terraform init -test-directory=tests/integration
-terraform test -test-directory=tests/integration
+# Integration. Needs AWS credentials in us-west-2.
+cd tests/integration
+terraform init
+terraform test
 ```
 
-The integration lane provisions a minimal VPC + EBS + SSM parameters, boots the module's pinned AMI, and runs an SSM-driven probe inside the instance that checks `cloud-init status`, `terrat-oss` on `localhost:8080`, and `pg_isready` in the postgres container. See `tests/integration/README.md` for the gate details.
+CI runs `terraform fmt`, `terraform validate`, and the unit lane on every pull request, once with the committed provider lock, once with the lowest AWS provider version the module allows, and once with the newest. A weekly scheduled run repeats that against the newest provider. The integration lane runs only on manual dispatch.
+
+The integration lane has two tests. The tunnel-mode test builds a small VPC, an EBS volume, and placeholder SSM parameters, boots the harness's pinned AMI, and runs a probe over SSM inside the instance. The probe checks that cloud-init finished, that `terrat-oss` listens on `localhost:8080`, and that `pg_isready` succeeds in the postgres container. The nginx-mode test adds a real Elastic IP, checks the proxy chain from inside the instance, and curls the Elastic IP from the machine running Terraform to prove the security group and EIP work from outside. Neither test exercises real Let's Encrypt issuance or the Cloudflare Tunnel itself. See `tests/integration/README.md` for the gate details.
