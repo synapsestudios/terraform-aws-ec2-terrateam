@@ -192,6 +192,6 @@ terraform init
 terraform test
 ```
 
-CI runs `terraform fmt`, `terraform validate`, and the unit lane on every pull request, once with the committed provider lock, once with the lowest AWS provider version the module allows, and once with the newest. A weekly scheduled run repeats that against the newest provider. The integration lane runs only on manual dispatch.
+CI runs `terraform fmt`, `terraform validate`, and the unit lane on every pull request, once with the lowest AWS provider version the module allows and once with the newest. A weekly scheduled run repeats that against the newest provider. The integration lane runs only on manual dispatch.
 
 The integration lane has two tests. The tunnel-mode test builds a small VPC, an EBS volume, and placeholder SSM parameters, boots the harness's pinned AMI, and runs a probe over SSM inside the instance. The probe checks that cloud-init finished, that `terrat-oss` listens on `localhost:8080`, and that `pg_isready` succeeds in the postgres container. The nginx-mode test adds a real Elastic IP, checks the proxy chain from inside the instance, and curls the Elastic IP from the machine running Terraform to prove the security group and EIP work from outside. Neither test exercises real Let's Encrypt issuance, the module-managed Route 53 record, or the Cloudflare Tunnel itself. See `tests/integration/README.md` for the gate details.
