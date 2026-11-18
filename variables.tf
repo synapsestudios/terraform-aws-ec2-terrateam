@@ -118,7 +118,7 @@ variable "cloudflared_image_tag" {
 variable "nginx_image_tag" {
   description = "nginx image tag (ingress_mode = \"nginx_letsencrypt\" only). Pinned by default; override deliberately."
   type        = string
-  default     = "1.31.1-alpine"
+  default     = "1.31.9-alpine"
 }
 
 variable "certbot_image_tag" {
