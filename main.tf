@@ -50,28 +50,29 @@ resource "aws_security_group" "this" {
   description = "Terrateam host: egress only. ingress_mode=cloudflare_tunnel adds no ingress (Cloudflare Tunnel is outbound); ingress_mode=nginx_letsencrypt opens 80/443."
   vpc_id      = var.vpc_id
   tags        = local.resource_tags
+}
 
-  # Mode-conditional ingress (see local.ingress_rules in ingress.tf). Empty list
-  # in cloudflare_tunnel mode => no ingress block rendered, preserving the
-  # zero-ingress posture.
-  dynamic "ingress" {
-    for_each = local.ingress_rules
-    content {
-      description = ingress.value.description
-      from_port   = ingress.value.from_port
-      to_port     = ingress.value.to_port
-      protocol    = "tcp"
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-  }
+# Mode-conditional ingress (see local.ingress_rules in ingress.tf). The map is
+# empty in cloudflare_tunnel mode, so no ingress rule exists and the zero-ingress
+# posture holds.
+resource "aws_vpc_security_group_ingress_rule" "this" {
+  for_each = { for rule in local.ingress_rules : tostring(rule.from_port) => rule }
 
-  egress {
-    description = "Outbound allow all"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  security_group_id = aws_security_group.this.id
+  description       = each.value.description
+  from_port         = each.value.from_port
+  to_port           = each.value.to_port
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+  tags              = local.resource_tags
+}
+
+resource "aws_vpc_security_group_egress_rule" "all" {
+  security_group_id = aws_security_group.this.id
+  description       = "Outbound allow all"
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+  tags              = local.resource_tags
 }
 
 resource "aws_iam_role" "this" {

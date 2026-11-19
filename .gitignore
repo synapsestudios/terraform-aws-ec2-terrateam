@@ -33,3 +33,6 @@ override.tf.json
 **/terraform.d/*
 
 /.terraform.lock.hcl
+
+# npm
+node_modules/

@@ -116,14 +116,18 @@ run "root_volume_is_encrypted_gp3" {
 }
 
 run "no_ingress_rules_traffic_via_tunnel" {
-  # apply (not plan): aws_security_group.ingress is a computed set that the
-  # provider leaves unknown at plan time, so the assertion can't evaluate
-  # under command = plan even though we use mock_provider.
+  # apply (not plan): later plan-only runs in this file read values from the
+  # state this run leaves behind.
   command = apply
 
   assert {
-    condition     = length(aws_security_group.this.ingress) == 0
+    condition     = length(aws_vpc_security_group_ingress_rule.this) == 0
     error_message = "Security group must not allow ingress; ingress comes via Cloudflare Tunnel outbound"
+  }
+
+  assert {
+    condition     = aws_vpc_security_group_egress_rule.all.ip_protocol == "-1" && aws_vpc_security_group_egress_rule.all.cidr_ipv4 == "0.0.0.0/0"
+    error_message = "Security group must allow all outbound traffic"
   }
 }
 

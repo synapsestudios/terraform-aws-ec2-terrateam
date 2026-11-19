@@ -77,9 +77,8 @@ run "ingress_mode_rejects_invalid_value" {
 }
 
 run "nginx_mode_opens_80_and_443" {
-  # apply (not plan): aws_security_group.ingress is a computed set the provider
-  # leaves unknown at plan time, so the assertion can't evaluate under plan even
-  # with mock_provider — same reason module.tftest.hcl's tunnel-mode check applies.
+  # apply (not plan): later plan-only runs in this file read values from the
+  # state this run leaves behind.
   command = apply
 
   variables {
@@ -88,18 +87,18 @@ run "nginx_mode_opens_80_and_443" {
   }
 
   assert {
-    condition     = length(aws_security_group.this.ingress) == 2
+    condition     = length(aws_vpc_security_group_ingress_rule.this) == 2
     error_message = "nginx_letsencrypt must open exactly two ingress ports (80 and 443)"
   }
 
   assert {
-    condition     = toset([for r in aws_security_group.this.ingress : r.from_port]) == toset([80, 443])
+    condition     = toset([for r in aws_vpc_security_group_ingress_rule.this : r.from_port]) == toset([80, 443])
     error_message = "nginx_letsencrypt ingress must open ports 80 (ACME HTTP-01 + redirect) and 443 (HTTPS)"
   }
 
   assert {
     condition = alltrue([
-      for r in aws_security_group.this.ingress : contains(r.cidr_blocks, "0.0.0.0/0")
+      for r in aws_vpc_security_group_ingress_rule.this : r.cidr_ipv4 == "0.0.0.0/0"
     ])
     error_message = "nginx_letsencrypt ingress must accept traffic from 0.0.0.0/0"
   }
