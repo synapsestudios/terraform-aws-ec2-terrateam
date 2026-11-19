@@ -69,7 +69,7 @@ run "start_in_cloudflare_tunnel" {
   }
 
   assert {
-    condition     = length(aws_security_group.this.ingress) == 0
+    condition     = length(aws_vpc_security_group_ingress_rule.this) == 0
     error_message = "initial cloudflare_tunnel deployment must have zero SG ingress"
   }
 
@@ -109,7 +109,7 @@ run "switch_to_nginx_letsencrypt" {
   }
 
   assert {
-    condition     = length(aws_security_group.this.ingress) == 2
+    condition     = length(aws_vpc_security_group_ingress_rule.this) == 2
     error_message = "switching to nginx_letsencrypt must open 80 + 443"
   }
 
@@ -185,13 +185,11 @@ run "switch_back_to_cloudflare_tunnel" {
     }
   }
 
-  # NB: we don't assert SG ingress == 0 here. aws_security_group.ingress is a
-  # computed set, and mock_provider recomputes it when the config adds rules
-  # (0 -> 2, asserted in switch_to_nginx) but carries the old value forward when
-  # the config removes them (2 -> 0) — it can't model set removal on update. The
-  # real provider revokes the rules; fresh-apply tunnel mode (no_ingress_rules_*)
-  # proves zero ingress. The reliable switch-back signals here are the EIP release
-  # and the reverted user_data below.
+  assert {
+    condition     = length(aws_vpc_security_group_ingress_rule.this) == 0
+    error_message = "switching back to cloudflare_tunnel must remove the 80 and 443 ingress rules"
+  }
+
   assert {
     condition     = length(aws_eip_association.this) == 0
     error_message = "switching back to cloudflare_tunnel must release the EIP association"
